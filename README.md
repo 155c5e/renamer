@@ -3,7 +3,29 @@
 Bulk file renamer / organizer. GUI frontend (egui), metadata-driven templates.
 Linux + macOS.
 
-## Run
+## Download
+
+Prebuilt binaries — no Rust needed. All releases:
+<https://github.com/155c5e/renamer/releases>
+
+| Platform | Latest download |
+|----------|-----------------|
+| Linux (x86_64) | [renamer-linux-x86_64](https://github.com/155c5e/renamer/releases/latest/download/renamer-linux-x86_64) |
+| macOS (Apple Silicon) | [renamer-macos-arm64](https://github.com/155c5e/renamer/releases/latest/download/renamer-macos-arm64) |
+
+After downloading:
+
+```sh
+# Linux
+chmod +x renamer-linux-x86_64 && ./renamer-linux-x86_64
+
+# macOS (strip Gatekeeper quarantine on the unsigned binary, once)
+chmod +x renamer-macos-arm64
+xattr -d com.apple.quarantine renamer-macos-arm64
+./renamer-macos-arm64
+```
+
+## Build / run from source
 
 ```sh
 cargo run --release
