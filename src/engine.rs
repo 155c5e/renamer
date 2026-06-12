@@ -76,6 +76,8 @@ fn collect_files(source: &Path, recursive: bool) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_file())
+        // never treat our own undo log as a renamable file
+        .filter(|e| e.file_name().to_str() != Some(UNDO_FILE))
         .map(|e| e.into_path())
         .collect();
     // Sort so the {n} counter is stable across runs.
@@ -145,10 +147,23 @@ pub fn build_plan(settings: &Settings) -> Plan {
     }
 }
 
+/// A single completed move, used to reverse a rename batch.
+#[derive(Debug, Clone)]
+pub struct UndoEntry {
+    /// Original location (where the file came from).
+    pub from: PathBuf,
+    /// New location (where the file was moved to).
+    pub to: PathBuf,
+}
+
+/// Filename of the persisted undo log, written into the output root.
+pub const UNDO_FILE: &str = ".renamer_undo.log";
+
 /// Apply every `Ok` row in the plan: create parent folders, then rename.
-/// Mutates row statuses to `Done`/`Failed`. Returns count renamed.
-pub fn apply_plan(plan: &mut Plan) -> usize {
-    let mut done = 0;
+/// Mutates row statuses to `Done`/`Failed`. Returns the undo log (one entry
+/// per successful move); `.len()` is the number renamed.
+pub fn apply_plan(plan: &mut Plan) -> Vec<UndoEntry> {
+    let mut undo = Vec::new();
     for row in plan.rows.iter_mut() {
         if row.status != RowStatus::Ok {
             continue;
@@ -163,12 +178,87 @@ pub fn apply_plan(plan: &mut Plan) -> usize {
         match std::fs::rename(&row.src, &dest) {
             Ok(_) => {
                 row.status = RowStatus::Done;
-                done += 1;
+                undo.push(UndoEntry {
+                    from: row.src.clone(),
+                    to: dest,
+                });
             }
             Err(e) => row.status = RowStatus::Failed(e.to_string()),
         }
     }
-    done
+    undo
+}
+
+/// Reverse a rename batch: move each `to` back to `from` (newest first),
+/// recreating original parent folders and removing folders left empty by the
+/// undo. Returns `(reverted, errors)`.
+pub fn undo(entries: &[UndoEntry]) -> (usize, Vec<String>) {
+    let mut reverted = 0;
+    let mut errors = Vec::new();
+
+    // Reverse order so files moved later are restored first.
+    for e in entries.iter().rev() {
+        if let Some(parent) = e.from.parent() {
+            if let Err(err) = std::fs::create_dir_all(parent) {
+                errors.push(format!("{}: mkdir: {err}", e.to.display()));
+                continue;
+            }
+        }
+        match std::fs::rename(&e.to, &e.from) {
+            Ok(_) => reverted += 1,
+            Err(err) => errors.push(format!("{}: {err}", e.to.display())),
+        }
+    }
+
+    // Best-effort cleanup of directories emptied by the undo. Deepest first so
+    // nested empties collapse. `remove_dir` only succeeds when truly empty.
+    let mut dirs: Vec<PathBuf> = entries
+        .iter()
+        .filter_map(|e| e.to.parent().map(|p| p.to_path_buf()))
+        .collect();
+    dirs.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+    dirs.dedup();
+    for d in dirs {
+        let _ = std::fs::remove_dir(&d);
+    }
+
+    (reverted, errors)
+}
+
+/// Persist an undo log to `<output_root>/.renamer_undo.log`. Each entry is two
+/// lines (`from` then `to`) so tabs in names are safe.
+pub fn write_undo_log(output_root: &Path, entries: &[UndoEntry]) -> std::io::Result<()> {
+    let mut out = String::new();
+    for e in entries {
+        out.push_str(&e.from.to_string_lossy());
+        out.push('\n');
+        out.push_str(&e.to.to_string_lossy());
+        out.push('\n');
+    }
+    std::fs::write(output_root.join(UNDO_FILE), out)
+}
+
+/// Read a previously written undo log, if present. Returns empty when absent.
+pub fn read_undo_log(output_root: &Path) -> Vec<UndoEntry> {
+    let path = output_root.join(UNDO_FILE);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    let mut lines = content.lines();
+    let mut entries = Vec::new();
+    while let (Some(from), Some(to)) = (lines.next(), lines.next()) {
+        entries.push(UndoEntry {
+            from: PathBuf::from(from),
+            to: PathBuf::from(to),
+        });
+    }
+    entries
+}
+
+/// Delete the persisted undo log (e.g. after a successful undo).
+pub fn clear_undo_log(output_root: &Path) {
+    let _ = std::fs::remove_file(output_root.join(UNDO_FILE));
 }
 
 #[cfg(test)]
@@ -201,8 +291,8 @@ mod tests {
         assert_eq!(plan.rows.len(), 2);
         assert_eq!(plan.ok_count(), 2);
 
-        let n = apply_plan(&mut plan);
-        assert_eq!(n, 2);
+        let log = apply_plan(&mut plan);
+        assert_eq!(log.len(), 2);
         // folder created, files moved with extension kept
         let moved: Vec<_> = fs::read_dir(dir.join("sorted"))
             .unwrap()
@@ -211,6 +301,40 @@ mod tests {
             .collect();
         assert_eq!(moved.len(), 2);
         assert!(moved.iter().all(|f| f.ends_with(".txt")));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn undo_restores_files_and_removes_empty_folders() {
+        let dir = tmpdir("undo");
+        fs::write(dir.join("a.txt"), "1").unwrap();
+        fs::write(dir.join("b.txt"), "2").unwrap();
+        let s = Settings {
+            source: dir.clone(),
+            output_root: dir.clone(),
+            template: "sorted/{name}".into(),
+            recursive: false,
+            append_ext: true,
+        };
+        let mut plan = build_plan(&s);
+        let log = apply_plan(&mut plan);
+        assert_eq!(log.len(), 2);
+        assert!(dir.join("sorted").exists());
+        assert!(!dir.join("a.txt").exists());
+
+        // round-trips through the persisted log
+        write_undo_log(&dir, &log).unwrap();
+        let loaded = read_undo_log(&dir);
+        assert_eq!(loaded.len(), 2);
+
+        let (reverted, errors) = undo(&loaded);
+        assert_eq!(reverted, 2);
+        assert!(errors.is_empty());
+        assert!(dir.join("a.txt").exists());
+        assert!(dir.join("b.txt").exists());
+        // emptied folder cleaned up
+        assert!(!dir.join("sorted").exists());
 
         fs::remove_dir_all(&dir).unwrap();
     }

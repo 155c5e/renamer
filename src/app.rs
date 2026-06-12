@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::engine::{self, Plan, RowStatus, Settings};
+use crate::engine::{self, Plan, RowStatus, Settings, UndoEntry};
 use crate::metadata::FIELDS;
 
 pub struct RenamerApp {
@@ -14,6 +14,9 @@ pub struct RenamerApp {
     append_ext: bool,
     plan: Option<Plan>,
     message: String,
+    /// Undo log for the most recent applied batch (in memory; also persisted
+    /// to the output root). Drives the Undo button.
+    last_undo: Vec<UndoEntry>,
 }
 
 impl Default for RenamerApp {
@@ -26,11 +29,29 @@ impl Default for RenamerApp {
             append_ext: true,
             plan: None,
             message: "Pick a source folder to begin.".to_string(),
+            last_undo: Vec::new(),
         }
     }
 }
 
 impl RenamerApp {
+    fn output_root(&self) -> Option<PathBuf> {
+        let source = self.source.clone()?;
+        Some(self.output.clone().unwrap_or(source))
+    }
+
+    /// Pull any persisted undo log from the current output root so undo works
+    /// across sessions.
+    fn load_undo_log(&mut self) {
+        if let Some(root) = self.output_root() {
+            let log = engine::read_undo_log(&root);
+            if !log.is_empty() {
+                self.message = format!("Loaded undo log: {} move(s) can be reverted.", log.len());
+            }
+            self.last_undo = log;
+        }
+    }
+
     fn settings(&self) -> Option<Settings> {
         let source = self.source.clone()?;
         let output_root = self.output.clone().unwrap_or_else(|| source.clone());
@@ -60,12 +81,43 @@ impl RenamerApp {
     }
 
     fn do_apply(&mut self) {
-        if let Some(plan) = self.plan.as_mut() {
-            let n = engine::apply_plan(plan);
-            self.message = format!("Renamed {n} file(s). Re-run Preview to refresh.");
-        } else {
+        let Some(plan) = self.plan.as_mut() else {
             self.message = "Run Preview before Apply.".to_string();
+            return;
+        };
+        let log = engine::apply_plan(plan);
+        let n = log.len();
+        if let Some(root) = self.output_root() {
+            if let Err(e) = engine::write_undo_log(&root, &log) {
+                self.message = format!("Renamed {n} file(s), but undo log not saved: {e}");
+            } else {
+                self.message =
+                    format!("Renamed {n} file(s). Undo available. Re-run Preview to refresh.");
+            }
         }
+        self.last_undo = log;
+    }
+
+    fn do_undo(&mut self) {
+        if self.last_undo.is_empty() {
+            self.message = "Nothing to undo.".to_string();
+            return;
+        }
+        let (reverted, errors) = engine::undo(&self.last_undo);
+        if let Some(root) = self.output_root() {
+            engine::clear_undo_log(&root);
+        }
+        self.last_undo.clear();
+        self.plan = None;
+        self.message = if errors.is_empty() {
+            format!("Undo complete: {reverted} file(s) restored.")
+        } else {
+            format!(
+                "Undo: {reverted} restored, {} failed (e.g. {}).",
+                errors.len(),
+                errors.first().cloned().unwrap_or_default()
+            )
+        };
     }
 }
 
@@ -99,6 +151,7 @@ impl eframe::App for RenamerApp {
                 if ui.button("Source folder…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
                         self.source = Some(p);
+                        self.load_undo_log();
                     }
                 }
                 ui.label(
@@ -112,10 +165,12 @@ impl eframe::App for RenamerApp {
                 if ui.button("Output folder…").clicked() {
                     if let Some(p) = rfd::FileDialog::new().pick_folder() {
                         self.output = Some(p);
+                        self.load_undo_log();
                     }
                 }
                 if ui.button("× same as source").clicked() {
                     self.output = None;
+                    self.load_undo_log();
                 }
                 ui.label(
                     self.output
@@ -148,6 +203,16 @@ impl eframe::App for RenamerApp {
                     .clicked()
                 {
                     self.do_apply();
+                }
+                let can_undo = !self.last_undo.is_empty();
+                if ui
+                    .add_enabled(
+                        can_undo,
+                        egui::Button::new(format!("Undo ({})", self.last_undo.len())),
+                    )
+                    .clicked()
+                {
+                    self.do_undo();
                 }
             });
             ui.add_space(2.0);

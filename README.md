@@ -66,3 +66,11 @@ Rename to date + sequence:
 
 "Keep extension" (on by default) appends the original extension if the template
 doesn't already end with one.
+
+## Undo
+
+Each **Apply** writes an undo log (`.renamer_undo.log`) into the output root and
+enables the **Undo** button, which moves every file back and removes folders the
+rename left empty. The log persists, so re-picking the same source/output folder
+in a later session reloads it and the Undo button works again. The log file is
+ignored by scans and never gets renamed itself.
