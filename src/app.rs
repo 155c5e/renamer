@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 
 use eframe::egui;
@@ -7,6 +7,13 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::engine::{self, Plan, Progress, RowStatus, Settings, UndoEntry};
 use crate::metadata::FIELDS;
+use crate::pcloud::{self, Client, Region, RemotePlan, RemoteUndo};
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Mode {
+    Local,
+    PCloud,
+}
 
 /// Result handed back from a worker thread to the GUI thread.
 enum BgResult {
@@ -20,40 +27,74 @@ enum BgResult {
         reverted: usize,
         errors: Vec<String>,
     },
+    Login(Result<Client, String>),
+    RemotePreview(Result<RemotePlan, String>),
+    RemoteApply {
+        plan: RemotePlan,
+        undo: Vec<RemoteUndo>,
+    },
+    RemoteUndo {
+        reverted: usize,
+        errors: Vec<String>,
+    },
+}
+
+/// Lightweight row for the results table, built from whichever plan is active.
+struct RowView {
+    name: String,
+    target: String,
+    status: RowStatus,
 }
 
 pub struct RenamerApp {
+    mode: Mode,
+
+    // --- local mode ---
     source: Option<PathBuf>,
     output: Option<PathBuf>, // None => same as source
+    plan: Option<Plan>,
+    last_undo: Vec<UndoEntry>,
+
+    // --- pcloud mode ---
+    pc_region: Region,
+    pc_email: String,
+    pc_password: String,
+    pc_path: String,
+    pc_client: Option<Client>,
+    remote_plan: Option<RemotePlan>,
+    remote_undo: Vec<RemoteUndo>,
+
+    // --- shared ---
     template: String,
     recursive: bool,
     append_ext: bool,
-    plan: Option<Plan>,
     message: String,
-    /// Undo log for the most recent applied batch (in memory; also persisted
-    /// to the output root). Drives the Undo button.
-    last_undo: Vec<UndoEntry>,
 
     // --- background work ---
-    /// Receiver for the in-flight worker thread's result, if any.
     rx: Option<Receiver<BgResult>>,
-    /// Shared progress counters for the in-flight worker.
     progress: Option<Arc<Progress>>,
-    /// Label for what the worker is doing ("Scanning", "Renaming", …).
     busy_label: String,
 }
 
 impl Default for RenamerApp {
     fn default() -> Self {
         Self {
+            mode: Mode::Local,
             source: None,
             output: None,
-            template: "{date_taken:%Y}/{date_taken:%m}/{name}".to_string(),
+            plan: None,
+            last_undo: Vec::new(),
+            pc_region: Region::Us,
+            pc_email: String::new(),
+            pc_password: String::new(),
+            pc_path: "/".to_string(),
+            pc_client: None,
+            remote_plan: None,
+            remote_undo: Vec::new(),
+            template: "{date_modified:%Y}/{date_modified:%m}/{name}".to_string(),
             recursive: false,
             append_ext: true,
-            plan: None,
-            message: "Pick a source folder to begin.".to_string(),
-            last_undo: Vec::new(),
+            message: "Pick a source folder, or switch to pCloud.".to_string(),
             rx: None,
             progress: None,
             busy_label: String::new(),
@@ -67,8 +108,6 @@ impl RenamerApp {
         Some(self.output.clone().unwrap_or(source))
     }
 
-    /// Pull any persisted undo log from the current output root so undo works
-    /// across sessions.
     fn load_undo_log(&mut self) {
         if let Some(root) = self.output_root() {
             let log = engine::read_undo_log(&root);
@@ -91,13 +130,11 @@ impl RenamerApp {
         })
     }
 
-    /// Set up a fresh channel + progress for a worker and return the sender
-    /// and a repaint-capable context clone.
     fn start_worker(
         &mut self,
         ctx: &egui::Context,
         label: &str,
-    ) -> (std::sync::mpsc::Sender<BgResult>, Arc<Progress>, egui::Context) {
+    ) -> (Sender<BgResult>, Arc<Progress>, egui::Context) {
         let (tx, rx) = channel();
         let progress = Arc::new(Progress::default());
         self.rx = Some(rx);
@@ -105,6 +142,8 @@ impl RenamerApp {
         self.busy_label = label.to_string();
         (tx, progress, ctx.clone())
     }
+
+    // ---- local actions ----
 
     fn do_preview(&mut self, ctx: &egui::Context) {
         let Some(settings) = self.settings() else {
@@ -128,8 +167,13 @@ impl RenamerApp {
         let (tx, progress, ctx) = self.start_worker(ctx, "Renaming");
         std::thread::spawn(move || {
             let undo = engine::apply_plan_progress(&mut plan, &progress);
-            let log_err = root.and_then(|r| engine::write_undo_log(&r, &undo).err().map(|e| e.to_string()));
-            let _ = tx.send(BgResult::Apply { plan, undo, log_err });
+            let log_err =
+                root.and_then(|r| engine::write_undo_log(&r, &undo).err().map(|e| e.to_string()));
+            let _ = tx.send(BgResult::Apply {
+                plan,
+                undo,
+                log_err,
+            });
             ctx.request_repaint();
         });
     }
@@ -141,7 +185,7 @@ impl RenamerApp {
         }
         let entries = self.last_undo.clone();
         let root = self.output_root();
-        let (tx, _progress, ctx) = self.start_worker(ctx, "Undoing");
+        let (tx, _p, ctx) = self.start_worker(ctx, "Undoing");
         std::thread::spawn(move || {
             let (reverted, errors) = engine::undo(&entries);
             if let Some(r) = root {
@@ -152,8 +196,69 @@ impl RenamerApp {
         });
     }
 
-    /// Drain a finished worker's result and update state. Returns true if the
-    /// worker is still running.
+    // ---- pcloud actions ----
+
+    fn do_login(&mut self, ctx: &egui::Context) {
+        let (region, email, pass) = (self.pc_region, self.pc_email.clone(), self.pc_password.clone());
+        let (tx, _p, ctx) = self.start_worker(ctx, "Logging in");
+        std::thread::spawn(move || {
+            let res = Client::login(region, &email, &pass);
+            let _ = tx.send(BgResult::Login(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_remote_preview(&mut self, ctx: &egui::Context) {
+        let Some(client) = self.pc_client.clone() else {
+            self.message = "Log in to pCloud first.".to_string();
+            return;
+        };
+        let (path, recursive, template, append_ext) = (
+            self.pc_path.clone(),
+            self.recursive,
+            self.template.clone(),
+            self.append_ext,
+        );
+        let (tx, _p, ctx) = self.start_worker(ctx, "Listing pCloud");
+        std::thread::spawn(move || {
+            let res = client
+                .listfolder(&path, recursive)
+                .map(|files| pcloud::build_remote_plan(&files, &path, &template, append_ext));
+            let _ = tx.send(BgResult::RemotePreview(res));
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_remote_apply(&mut self, ctx: &egui::Context) {
+        let (Some(client), Some(mut plan)) = (self.pc_client.clone(), self.remote_plan.clone())
+        else {
+            self.message = "Preview before Apply.".to_string();
+            return;
+        };
+        let (tx, progress, ctx) = self.start_worker(ctx, "Renaming on pCloud");
+        std::thread::spawn(move || {
+            let undo = pcloud::apply_remote_plan(&client, &mut plan, &progress);
+            let _ = tx.send(BgResult::RemoteApply { plan, undo });
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_remote_undo(&mut self, ctx: &egui::Context) {
+        let (Some(client), false) = (self.pc_client.clone(), self.remote_undo.is_empty()) else {
+            self.message = "Nothing to undo.".to_string();
+            return;
+        };
+        let entries = self.remote_undo.clone();
+        let (tx, _p, ctx) = self.start_worker(ctx, "Undoing on pCloud");
+        std::thread::spawn(move || {
+            let (reverted, errors) = pcloud::undo_remote(&client, &entries);
+            let _ = tx.send(BgResult::RemoteUndo { reverted, errors });
+            ctx.request_repaint();
+        });
+    }
+
+    // ---- worker plumbing ----
+
     fn poll_worker(&mut self) -> bool {
         let Some(rx) = self.rx.as_ref() else {
             return false;
@@ -168,7 +273,6 @@ impl RenamerApp {
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => true,
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                // Worker died without sending; clear busy state.
                 self.rx = None;
                 self.progress = None;
                 self.busy_label.clear();
@@ -181,12 +285,7 @@ impl RenamerApp {
     fn handle_result(&mut self, result: BgResult) {
         match result {
             BgResult::Preview(plan) => {
-                self.message = format!(
-                    "{} file(s): {} ready, {} problem(s).",
-                    plan.rows.len(),
-                    plan.ok_count(),
-                    plan.problem_count()
-                );
+                self.message = plan_summary(plan.rows.len(), plan.ok_count(), plan.problem_count());
                 self.plan = Some(plan);
             }
             BgResult::Apply {
@@ -197,7 +296,7 @@ impl RenamerApp {
                 let n = undo.len();
                 self.message = match log_err {
                     Some(e) => format!("Renamed {n} file(s), but undo log not saved: {e}"),
-                    None => format!("Renamed {n} file(s). Undo available. Re-run Preview to refresh."),
+                    None => format!("Renamed {n} file(s). Undo available."),
                 };
                 self.plan = Some(plan);
                 self.last_undo = undo;
@@ -205,23 +304,110 @@ impl RenamerApp {
             BgResult::Undo { reverted, errors } => {
                 self.last_undo.clear();
                 self.plan = None;
-                self.message = if errors.is_empty() {
-                    format!("Undo complete: {reverted} file(s) restored.")
-                } else {
-                    format!(
-                        "Undo: {reverted} restored, {} failed (e.g. {}).",
-                        errors.len(),
-                        errors.first().cloned().unwrap_or_default()
-                    )
-                };
+                self.message = undo_summary(reverted, &errors);
+            }
+            BgResult::Login(Ok(client)) => {
+                self.pc_client = Some(client);
+                self.pc_password.clear();
+                self.message = "Connected to pCloud.".to_string();
+            }
+            BgResult::Login(Err(e)) => {
+                self.message = format!("Login failed: {e}");
+            }
+            BgResult::RemotePreview(Ok(plan)) => {
+                self.message =
+                    plan_summary(plan.rows.len(), plan.ok_count(), plan.problem_count());
+                self.remote_plan = Some(plan);
+            }
+            BgResult::RemotePreview(Err(e)) => {
+                self.message = format!("pCloud list failed: {e}");
+            }
+            BgResult::RemoteApply { plan, undo } => {
+                self.message = format!("Renamed {} file(s) on pCloud. Undo available.", undo.len());
+                self.remote_plan = Some(plan);
+                self.remote_undo = undo;
+            }
+            BgResult::RemoteUndo { reverted, errors } => {
+                self.remote_undo.clear();
+                self.remote_plan = None;
+                self.message = undo_summary(reverted, &errors);
             }
         }
+    }
+
+    /// Rows to display in the table for the active mode.
+    fn display_rows(&self) -> Vec<RowView> {
+        let map_local = |p: &Plan| {
+            p.rows
+                .iter()
+                .map(|r| RowView {
+                    name: r
+                        .src
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    target: r.rel_target.clone(),
+                    status: r.status.clone(),
+                })
+                .collect()
+        };
+        match self.mode {
+            Mode::Local => self.plan.as_ref().map(map_local).unwrap_or_default(),
+            Mode::PCloud => self
+                .remote_plan
+                .as_ref()
+                .map(|p| {
+                    p.rows
+                        .iter()
+                        .map(|r| RowView {
+                            name: r.display_name.clone(),
+                            target: r.rel_target.clone(),
+                            status: r.status.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }
+    }
+
+    fn can_apply(&self) -> bool {
+        match self.mode {
+            Mode::Local => self.plan.as_ref().map(|p| p.ok_count() > 0).unwrap_or(false),
+            Mode::PCloud => self
+                .remote_plan
+                .as_ref()
+                .map(|p| p.ok_count() > 0)
+                .unwrap_or(false),
+        }
+    }
+
+    fn undo_count(&self) -> usize {
+        match self.mode {
+            Mode::Local => self.last_undo.len(),
+            Mode::PCloud => self.remote_undo.len(),
+        }
+    }
+}
+
+fn plan_summary(total: usize, ok: usize, problems: usize) -> String {
+    format!("{total} file(s): {ok} ready, {problems} problem(s).")
+}
+
+fn undo_summary(reverted: usize, errors: &[String]) -> String {
+    if errors.is_empty() {
+        format!("Undo complete: {reverted} file(s) restored.")
+    } else {
+        format!(
+            "Undo: {reverted} restored, {} failed (e.g. {}).",
+            errors.len(),
+            errors.first().cloned().unwrap_or_default()
+        )
     }
 }
 
 impl eframe::App for RenamerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Pull in any finished background work, and keep animating while busy.
         let busy = self.poll_worker();
         if busy {
             ctx.request_repaint();
@@ -237,60 +423,41 @@ impl eframe::App for RenamerApp {
                     ui.monospace(format!("{{{f}}}"));
                 }
                 ui.separator();
-                ui.label("Extras:");
                 ui.monospace("{n:03}");
-                ui.small("sequence counter, zero-padded");
+                ui.small("sequence counter");
+                ui.monospace("{date_modified:%Y-%m}");
+                ui.small("strftime date format");
                 ui.separator();
-                ui.label("Date format example:");
-                ui.monospace("{date_taken:%Y-%m-%d}");
-                ui.small("strftime specifiers");
+                ui.label("Slashes make subfolders.");
                 ui.separator();
-                ui.label("Slashes make subfolders,");
-                ui.label("created automatically.");
-                ui.separator();
-                ui.small(
-                    "EXIF fields (date_taken, camera_*, iso, \
-                     width, height) read file contents; on cloud \
-                     drives that triggers downloads. Filesystem \
-                     fields don't.",
-                );
+                if self.mode == Mode::PCloud {
+                    ui.small(
+                        "pCloud mode: EXIF fields (date_taken, \
+                         camera_*, iso) are unavailable via the API. \
+                         Use date_modified / date_created.",
+                    );
+                } else {
+                    ui.small(
+                        "EXIF fields read file contents; on cloud \
+                         drives that triggers downloads. Filesystem \
+                         fields don't.",
+                    );
+                }
             });
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    if ui.button("Source folder…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.source = Some(p);
-                            self.load_undo_log();
-                        }
-                    }
-                    ui.label(
-                        self.source
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(none)".to_string()),
-                    );
+                    ui.label("Mode:");
+                    ui.selectable_value(&mut self.mode, Mode::Local, "Local files");
+                    ui.selectable_value(&mut self.mode, Mode::PCloud, "pCloud");
                 });
-                ui.horizontal(|ui| {
-                    if ui.button("Output folder…").clicked() {
-                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                            self.output = Some(p);
-                            self.load_undo_log();
-                        }
-                    }
-                    if ui.button("× same as source").clicked() {
-                        self.output = None;
-                        self.load_undo_log();
-                    }
-                    ui.label(
-                        self.output
-                            .as_ref()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|| "(same as source)".to_string()),
-                    );
-                });
+                ui.separator();
+                match self.mode {
+                    Mode::Local => self.local_controls(ui),
+                    Mode::PCloud => self.pcloud_controls(ui),
+                }
                 ui.horizontal(|ui| {
                     ui.label("Template:");
                     ui.add(
@@ -303,24 +470,29 @@ impl eframe::App for RenamerApp {
                     ui.checkbox(&mut self.recursive, "Recurse subfolders");
                     ui.checkbox(&mut self.append_ext, "Keep extension");
                     if ui.button("Preview").clicked() {
-                        self.do_preview(ctx);
+                        match self.mode {
+                            Mode::Local => self.do_preview(ctx),
+                            Mode::PCloud => self.do_remote_preview(ctx),
+                        }
                     }
-                    let can_apply = self.plan.as_ref().map(|p| p.ok_count() > 0).unwrap_or(false);
                     if ui
-                        .add_enabled(can_apply, egui::Button::new("Apply rename"))
+                        .add_enabled(self.can_apply(), egui::Button::new("Apply rename"))
                         .clicked()
                     {
-                        self.do_apply(ctx);
+                        match self.mode {
+                            Mode::Local => self.do_apply(ctx),
+                            Mode::PCloud => self.do_remote_apply(ctx),
+                        }
                     }
-                    let can_undo = !self.last_undo.is_empty();
+                    let undo_n = self.undo_count();
                     if ui
-                        .add_enabled(
-                            can_undo,
-                            egui::Button::new(format!("Undo ({})", self.last_undo.len())),
-                        )
+                        .add_enabled(undo_n > 0, egui::Button::new(format!("Undo ({undo_n})")))
                         .clicked()
                     {
-                        self.do_undo(ctx);
+                        match self.mode {
+                            Mode::Local => self.do_undo(ctx),
+                            Mode::PCloud => self.do_remote_undo(ctx),
+                        }
                     }
                 });
             });
@@ -349,12 +521,13 @@ impl eframe::App for RenamerApp {
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            let Some(plan) = self.plan.as_ref() else {
+            let rows = self.display_rows();
+            if rows.is_empty() {
                 ui.centered_and_justified(|ui| {
                     ui.label("No preview yet. Set a template and click Preview.");
                 });
                 return;
-            };
+            }
 
             TableBuilder::new(ui)
                 .striped(true)
@@ -373,18 +546,13 @@ impl eframe::App for RenamerApp {
                     });
                 })
                 .body(|mut body| {
-                    for row in &plan.rows {
+                    for row in &rows {
                         body.row(18.0, |mut r| {
                             r.col(|ui| {
-                                let name = row
-                                    .src
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or("");
-                                ui.monospace(name);
+                                ui.monospace(&row.name);
                             });
                             r.col(|ui| {
-                                ui.monospace(&row.rel_target);
+                                ui.monospace(&row.target);
                             });
                             r.col(|ui| {
                                 let (txt, color) = status_label(&row.status);
@@ -394,6 +562,86 @@ impl eframe::App for RenamerApp {
                     }
                 });
         });
+    }
+}
+
+impl RenamerApp {
+    fn local_controls(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Source folder…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.source = Some(p);
+                    self.load_undo_log();
+                }
+            }
+            ui.label(
+                self.source
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(none)".to_string()),
+            );
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Output folder…").clicked() {
+                if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                    self.output = Some(p);
+                    self.load_undo_log();
+                }
+            }
+            if ui.button("× same as source").clicked() {
+                self.output = None;
+                self.load_undo_log();
+            }
+            ui.label(
+                self.output
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "(same as source)".to_string()),
+            );
+        });
+    }
+
+    fn pcloud_controls(&mut self, ui: &mut egui::Ui) {
+        if self.pc_client.is_none() {
+            ui.horizontal(|ui| {
+                ui.label("Region:");
+                ui.selectable_value(&mut self.pc_region, Region::Us, "US");
+                ui.selectable_value(&mut self.pc_region, Region::Eu, "EU");
+            });
+            ui.horizontal(|ui| {
+                ui.label("Email:");
+                ui.add(egui::TextEdit::singleline(&mut self.pc_email).desired_width(220.0));
+            });
+            ui.horizontal(|ui| {
+                ui.label("Password:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pc_password)
+                        .password(true)
+                        .desired_width(220.0),
+                );
+                let ctx = ui.ctx().clone();
+                if ui.button("Log in").clicked() {
+                    self.do_login(&ctx);
+                }
+            });
+        } else {
+            ui.horizontal(|ui| {
+                ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "● Connected");
+                if ui.button("Log out").clicked() {
+                    self.pc_client = None;
+                    self.remote_plan = None;
+                    self.remote_undo.clear();
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Remote folder:");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.pc_path)
+                        .desired_width(f32::INFINITY)
+                        .font(egui::TextStyle::Monospace),
+                );
+            });
+        }
     }
 }
 

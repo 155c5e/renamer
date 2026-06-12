@@ -111,6 +111,7 @@ fn collect_files(source: &Path, recursive: bool) -> Vec<PathBuf> {
 }
 
 /// Build a preview plan. Convenience wrapper without progress reporting.
+#[allow(dead_code)] // used by tests; app uses the _progress variant
 pub fn build_plan(settings: &Settings) -> Plan {
     build_plan_progress(settings, &Progress::default())
 }
@@ -197,6 +198,7 @@ pub struct UndoEntry {
 pub const UNDO_FILE: &str = ".renamer_undo.log";
 
 /// Apply every `Ok` row in the plan. Convenience wrapper without progress.
+#[allow(dead_code)] // used by tests; app uses the _progress variant
 pub fn apply_plan(plan: &mut Plan) -> Vec<UndoEntry> {
     apply_plan_progress(plan, &Progress::default())
 }

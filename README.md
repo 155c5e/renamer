@@ -41,6 +41,30 @@ cargo run --release
 Slashes in a template create subfolders. Field values containing slashes are
 sanitized to `_` so only template slashes make directories.
 
+Scanning, renaming and undo run on a background thread with a progress bar, so
+the window stays responsive on slow/streamed folders. EXIF is only read when the
+template actually uses an EXIF field (and only for image files) — a rename using
+just filesystem fields never opens file contents.
+
+## pCloud mode
+
+Big folders streamed from pCloud are slow because the local filesystem downloads
+files on access. The **pCloud** mode skips that entirely: it talks to the pCloud
+API, so listing and renaming happen server-side with no downloads.
+
+1. Switch **Mode** to **pCloud**, pick your data **Region** (US / EU), log in
+   with your pCloud email + password (sent once over HTTPS, not stored; cleared
+   from memory after login).
+2. Enter the **Remote folder** (e.g. `/Camera`).
+3. **Preview** / **Apply rename** / **Undo** work the same as local — renames and
+   folder creation are server-side.
+
+Caveats:
+- The API does **not** expose EXIF, so `date_taken` / `camera_*` / `iso` are
+  unavailable in this mode. Use `date_modified` / `date_created` (and
+  `width` / `height`, which the API does provide for images).
+- pCloud undo is in-memory for the session (not persisted like local undo).
+
 ## Template fields
 
 | Field | Meaning |

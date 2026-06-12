@@ -3,6 +3,7 @@
 mod app;
 mod engine;
 mod metadata;
+mod pcloud;
 mod template;
 
 use app::RenamerApp;
