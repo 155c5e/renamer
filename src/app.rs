@@ -1,10 +1,26 @@
 use std::path::PathBuf;
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::engine::{self, Plan, RowStatus, Settings, UndoEntry};
+use crate::engine::{self, Plan, Progress, RowStatus, Settings, UndoEntry};
 use crate::metadata::FIELDS;
+
+/// Result handed back from a worker thread to the GUI thread.
+enum BgResult {
+    Preview(Plan),
+    Apply {
+        plan: Plan,
+        undo: Vec<UndoEntry>,
+        log_err: Option<String>,
+    },
+    Undo {
+        reverted: usize,
+        errors: Vec<String>,
+    },
+}
 
 pub struct RenamerApp {
     source: Option<PathBuf>,
@@ -17,6 +33,14 @@ pub struct RenamerApp {
     /// Undo log for the most recent applied batch (in memory; also persisted
     /// to the output root). Drives the Undo button.
     last_undo: Vec<UndoEntry>,
+
+    // --- background work ---
+    /// Receiver for the in-flight worker thread's result, if any.
+    rx: Option<Receiver<BgResult>>,
+    /// Shared progress counters for the in-flight worker.
+    progress: Option<Arc<Progress>>,
+    /// Label for what the worker is doing ("Scanning", "Renaming", …).
+    busy_label: String,
 }
 
 impl Default for RenamerApp {
@@ -30,6 +54,9 @@ impl Default for RenamerApp {
             plan: None,
             message: "Pick a source folder to begin.".to_string(),
             last_undo: Vec::new(),
+            rx: None,
+            progress: None,
+            busy_label: String::new(),
         }
     }
 }
@@ -64,10 +91,96 @@ impl RenamerApp {
         })
     }
 
-    fn do_preview(&mut self) {
-        match self.settings() {
-            Some(s) => {
-                let plan = engine::build_plan(&s);
+    /// Set up a fresh channel + progress for a worker and return the sender
+    /// and a repaint-capable context clone.
+    fn start_worker(
+        &mut self,
+        ctx: &egui::Context,
+        label: &str,
+    ) -> (std::sync::mpsc::Sender<BgResult>, Arc<Progress>, egui::Context) {
+        let (tx, rx) = channel();
+        let progress = Arc::new(Progress::default());
+        self.rx = Some(rx);
+        self.progress = Some(progress.clone());
+        self.busy_label = label.to_string();
+        (tx, progress, ctx.clone())
+    }
+
+    fn do_preview(&mut self, ctx: &egui::Context) {
+        let Some(settings) = self.settings() else {
+            self.message = "Pick a source folder first.".to_string();
+            return;
+        };
+        let (tx, progress, ctx) = self.start_worker(ctx, "Scanning");
+        std::thread::spawn(move || {
+            let plan = engine::build_plan_progress(&settings, &progress);
+            let _ = tx.send(BgResult::Preview(plan));
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_apply(&mut self, ctx: &egui::Context) {
+        let Some(mut plan) = self.plan.clone() else {
+            self.message = "Run Preview before Apply.".to_string();
+            return;
+        };
+        let root = self.output_root();
+        let (tx, progress, ctx) = self.start_worker(ctx, "Renaming");
+        std::thread::spawn(move || {
+            let undo = engine::apply_plan_progress(&mut plan, &progress);
+            let log_err = root.and_then(|r| engine::write_undo_log(&r, &undo).err().map(|e| e.to_string()));
+            let _ = tx.send(BgResult::Apply { plan, undo, log_err });
+            ctx.request_repaint();
+        });
+    }
+
+    fn do_undo(&mut self, ctx: &egui::Context) {
+        if self.last_undo.is_empty() {
+            self.message = "Nothing to undo.".to_string();
+            return;
+        }
+        let entries = self.last_undo.clone();
+        let root = self.output_root();
+        let (tx, _progress, ctx) = self.start_worker(ctx, "Undoing");
+        std::thread::spawn(move || {
+            let (reverted, errors) = engine::undo(&entries);
+            if let Some(r) = root {
+                engine::clear_undo_log(&r);
+            }
+            let _ = tx.send(BgResult::Undo { reverted, errors });
+            ctx.request_repaint();
+        });
+    }
+
+    /// Drain a finished worker's result and update state. Returns true if the
+    /// worker is still running.
+    fn poll_worker(&mut self) -> bool {
+        let Some(rx) = self.rx.as_ref() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(result) => {
+                self.rx = None;
+                self.progress = None;
+                self.busy_label.clear();
+                self.handle_result(result);
+                false
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                // Worker died without sending; clear busy state.
+                self.rx = None;
+                self.progress = None;
+                self.busy_label.clear();
+                self.message = "Background task ended unexpectedly.".to_string();
+                false
+            }
+        }
+    }
+
+    fn handle_result(&mut self, result: BgResult) {
+        match result {
+            BgResult::Preview(plan) => {
                 self.message = format!(
                     "{} file(s): {} ready, {} problem(s).",
                     plan.rows.len(),
@@ -76,53 +189,44 @@ impl RenamerApp {
                 );
                 self.plan = Some(plan);
             }
-            None => self.message = "Pick a source folder first.".to_string(),
-        }
-    }
-
-    fn do_apply(&mut self) {
-        let Some(plan) = self.plan.as_mut() else {
-            self.message = "Run Preview before Apply.".to_string();
-            return;
-        };
-        let log = engine::apply_plan(plan);
-        let n = log.len();
-        if let Some(root) = self.output_root() {
-            if let Err(e) = engine::write_undo_log(&root, &log) {
-                self.message = format!("Renamed {n} file(s), but undo log not saved: {e}");
-            } else {
-                self.message =
-                    format!("Renamed {n} file(s). Undo available. Re-run Preview to refresh.");
+            BgResult::Apply {
+                plan,
+                undo,
+                log_err,
+            } => {
+                let n = undo.len();
+                self.message = match log_err {
+                    Some(e) => format!("Renamed {n} file(s), but undo log not saved: {e}"),
+                    None => format!("Renamed {n} file(s). Undo available. Re-run Preview to refresh."),
+                };
+                self.plan = Some(plan);
+                self.last_undo = undo;
+            }
+            BgResult::Undo { reverted, errors } => {
+                self.last_undo.clear();
+                self.plan = None;
+                self.message = if errors.is_empty() {
+                    format!("Undo complete: {reverted} file(s) restored.")
+                } else {
+                    format!(
+                        "Undo: {reverted} restored, {} failed (e.g. {}).",
+                        errors.len(),
+                        errors.first().cloned().unwrap_or_default()
+                    )
+                };
             }
         }
-        self.last_undo = log;
-    }
-
-    fn do_undo(&mut self) {
-        if self.last_undo.is_empty() {
-            self.message = "Nothing to undo.".to_string();
-            return;
-        }
-        let (reverted, errors) = engine::undo(&self.last_undo);
-        if let Some(root) = self.output_root() {
-            engine::clear_undo_log(&root);
-        }
-        self.last_undo.clear();
-        self.plan = None;
-        self.message = if errors.is_empty() {
-            format!("Undo complete: {reverted} file(s) restored.")
-        } else {
-            format!(
-                "Undo: {reverted} restored, {} failed (e.g. {}).",
-                errors.len(),
-                errors.first().cloned().unwrap_or_default()
-            )
-        };
     }
 }
 
 impl eframe::App for RenamerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Pull in any finished background work, and keep animating while busy.
+        let busy = self.poll_worker();
+        if busy {
+            ctx.request_repaint();
+        }
+
         egui::SidePanel::right("fields")
             .resizable(false)
             .show(ctx, |ui| {
@@ -143,80 +247,104 @@ impl eframe::App for RenamerApp {
                 ui.separator();
                 ui.label("Slashes make subfolders,");
                 ui.label("created automatically.");
+                ui.separator();
+                ui.small(
+                    "EXIF fields (date_taken, camera_*, iso, \
+                     width, height) read file contents; on cloud \
+                     drives that triggers downloads. Filesystem \
+                     fields don't.",
+                );
             });
 
         egui::TopBottomPanel::top("controls").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Source folder…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.source = Some(p);
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Source folder…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            self.source = Some(p);
+                            self.load_undo_log();
+                        }
+                    }
+                    ui.label(
+                        self.source
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(none)".to_string()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Output folder…").clicked() {
+                        if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            self.output = Some(p);
+                            self.load_undo_log();
+                        }
+                    }
+                    if ui.button("× same as source").clicked() {
+                        self.output = None;
                         self.load_undo_log();
                     }
-                }
-                ui.label(
-                    self.source
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(none)".to_string()),
-                );
-            });
-            ui.horizontal(|ui| {
-                if ui.button("Output folder…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.output = Some(p);
-                        self.load_undo_log();
+                    ui.label(
+                        self.output
+                            .as_ref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(same as source)".to_string()),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Template:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.template)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.checkbox(&mut self.recursive, "Recurse subfolders");
+                    ui.checkbox(&mut self.append_ext, "Keep extension");
+                    if ui.button("Preview").clicked() {
+                        self.do_preview(ctx);
                     }
-                }
-                if ui.button("× same as source").clicked() {
-                    self.output = None;
-                    self.load_undo_log();
-                }
-                ui.label(
-                    self.output
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "(same as source)".to_string()),
-                );
+                    let can_apply = self.plan.as_ref().map(|p| p.ok_count() > 0).unwrap_or(false);
+                    if ui
+                        .add_enabled(can_apply, egui::Button::new("Apply rename"))
+                        .clicked()
+                    {
+                        self.do_apply(ctx);
+                    }
+                    let can_undo = !self.last_undo.is_empty();
+                    if ui
+                        .add_enabled(
+                            can_undo,
+                            egui::Button::new(format!("Undo ({})", self.last_undo.len())),
+                        )
+                        .clicked()
+                    {
+                        self.do_undo(ctx);
+                    }
+                });
             });
-            ui.horizontal(|ui| {
-                ui.label("Template:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.template)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace),
-                );
-            });
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut self.recursive, "Recurse subfolders");
-                ui.checkbox(&mut self.append_ext, "Keep extension");
-                if ui.button("Preview").clicked() {
-                    self.do_preview();
-                }
-                let can_apply = self
-                    .plan
-                    .as_ref()
-                    .map(|p| p.ok_count() > 0)
-                    .unwrap_or(false);
-                if ui
-                    .add_enabled(can_apply, egui::Button::new("Apply rename"))
-                    .clicked()
-                {
-                    self.do_apply();
-                }
-                let can_undo = !self.last_undo.is_empty();
-                if ui
-                    .add_enabled(
-                        can_undo,
-                        egui::Button::new(format!("Undo ({})", self.last_undo.len())),
-                    )
-                    .clicked()
-                {
-                    self.do_undo();
-                }
-            });
+
             ui.add_space(2.0);
-            ui.label(&self.message);
+            if busy {
+                let (done, total) = self
+                    .progress
+                    .as_ref()
+                    .map(|p| p.snapshot())
+                    .unwrap_or((0, 0));
+                let frac = if total > 0 {
+                    done as f32 / total as f32
+                } else {
+                    0.0
+                };
+                ui.add(
+                    egui::ProgressBar::new(frac)
+                        .text(format!("{} {done}/{total}", self.busy_label))
+                        .animate(true),
+                );
+            } else {
+                ui.label(&self.message);
+            }
             ui.add_space(4.0);
         });
 

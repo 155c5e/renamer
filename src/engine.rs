@@ -1,10 +1,35 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use walkdir::WalkDir;
 
-use crate::metadata::FileMeta;
+use crate::metadata::{self, FileMeta};
 use crate::template::Template;
+
+/// Shared, lock-free progress counters for a long-running scan/apply, so the
+/// GUI thread can render a progress bar while a worker thread does the I/O.
+#[derive(Default)]
+pub struct Progress {
+    pub total: AtomicUsize,
+    pub done: AtomicUsize,
+}
+
+impl Progress {
+    pub fn set_total(&self, n: usize) {
+        self.total.store(n, Ordering::Relaxed);
+    }
+    pub fn inc(&self) {
+        self.done.fetch_add(1, Ordering::Relaxed);
+    }
+    /// `(done, total)` snapshot.
+    pub fn snapshot(&self) -> (usize, usize) {
+        (
+            self.done.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct Settings {
@@ -85,17 +110,29 @@ fn collect_files(source: &Path, recursive: bool) -> Vec<PathBuf> {
     files
 }
 
-/// Build a preview plan without touching the filesystem.
+/// Build a preview plan. Convenience wrapper without progress reporting.
 pub fn build_plan(settings: &Settings) -> Plan {
+    build_plan_progress(settings, &Progress::default())
+}
+
+/// Build a preview plan, reporting progress into `progress`.
+///
+/// EXIF is only read when the template references an EXIF field, and only for
+/// image files — so a rename that uses just filesystem fields never opens file
+/// contents (no cloud downloads).
+pub fn build_plan_progress(settings: &Settings, progress: &Progress) -> Plan {
     let template = Template::parse(&settings.template);
+    let want_exif = metadata::needs_exif(&template.fields_used());
     let files = collect_files(&settings.source, settings.recursive);
+    progress.set_total(files.len());
 
     let mut rows: Vec<PlanRow> = Vec::with_capacity(files.len());
     // target rel path -> indices of rows producing it (for collision detection)
     let mut targets: HashMap<String, Vec<usize>> = HashMap::new();
 
     for (i, src) in files.into_iter().enumerate() {
-        let meta = FileMeta::read(&src);
+        let meta = FileMeta::read_with(&src, want_exif);
+        progress.inc();
         let (rel_target, status) = match template.render(&meta, i + 1) {
             Ok(mut rel) => {
                 if settings.append_ext && !meta.ext.is_empty() {
@@ -159,15 +196,27 @@ pub struct UndoEntry {
 /// Filename of the persisted undo log, written into the output root.
 pub const UNDO_FILE: &str = ".renamer_undo.log";
 
-/// Apply every `Ok` row in the plan: create parent folders, then rename.
-/// Mutates row statuses to `Done`/`Failed`. Returns the undo log (one entry
-/// per successful move); `.len()` is the number renamed.
+/// Apply every `Ok` row in the plan. Convenience wrapper without progress.
 pub fn apply_plan(plan: &mut Plan) -> Vec<UndoEntry> {
+    apply_plan_progress(plan, &Progress::default())
+}
+
+/// Apply every `Ok` row in the plan: create parent folders, then rename.
+/// Mutates row statuses to `Done`/`Failed`, reporting progress. Returns the
+/// undo log (one entry per successful move); `.len()` is the number renamed.
+pub fn apply_plan_progress(plan: &mut Plan, progress: &Progress) -> Vec<UndoEntry> {
+    let total = plan
+        .rows
+        .iter()
+        .filter(|r| r.status == RowStatus::Ok)
+        .count();
+    progress.set_total(total);
     let mut undo = Vec::new();
     for row in plan.rows.iter_mut() {
         if row.status != RowStatus::Ok {
             continue;
         }
+        progress.inc();
         let dest = plan.output_root.join(&row.rel_target);
         if let Some(parent) = dest.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {

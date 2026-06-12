@@ -72,6 +72,18 @@ impl Template {
         Template { tokens }
     }
 
+    /// Names of all `{field}` placeholders referenced, in order (with dups).
+    /// Lets the engine decide whether a scan needs to read EXIF.
+    pub fn fields_used(&self) -> Vec<String> {
+        self.tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Field { name, .. } => Some(name.clone()),
+                Token::Literal(_) => None,
+            })
+            .collect()
+    }
+
     /// Render to a relative path string. `index` feeds the `{n}` counter
     /// (1-based); `fmt` on `n` is a zero-pad width, e.g. `{n:03}`.
     pub fn render(&self, meta: &FileMeta, index: usize) -> Result<String, RenderError> {

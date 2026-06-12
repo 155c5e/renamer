@@ -27,8 +27,13 @@ pub struct FileMeta {
 }
 
 impl FileMeta {
-    /// Read all available metadata for `path`.
-    pub fn read(path: &Path) -> Self {
+    /// Read metadata, optionally including EXIF.
+    ///
+    /// EXIF requires opening and reading file *contents*, which on a streamed
+    /// cloud filesystem (pCloud, Dropbox, …) forces a download. The cheap
+    /// filesystem fields (name, size, dates) do not. Pass `want_exif: false`
+    /// to stay metadata-only and avoid downloads.
+    pub fn read_with(path: &Path, want_exif: bool) -> Self {
         let mut m = FileMeta::default();
 
         m.name = path
@@ -55,7 +60,9 @@ impl FileMeta {
             m.date_accessed = fsmeta.accessed().ok().map(systime_to_local);
         }
 
-        read_exif(path, &mut m);
+        if want_exif && is_image_ext(&m.ext) {
+            read_exif(path, &mut m);
+        }
         m
     }
 
@@ -107,6 +114,32 @@ pub const FIELDS: &[&str] = &[
     "width",
     "height",
 ];
+
+/// Template fields whose value comes from EXIF, i.e. require reading file
+/// contents. Used to decide whether a scan needs to open files at all.
+pub const EXIF_FIELDS: &[&str] = &[
+    "date_taken",
+    "camera_make",
+    "camera_model",
+    "lens",
+    "iso",
+    "width",
+    "height",
+];
+
+/// True if any of `fields` is EXIF-derived.
+pub fn needs_exif(fields: &[String]) -> bool {
+    fields.iter().any(|f| EXIF_FIELDS.contains(&f.as_str()))
+}
+
+/// File extensions worth attempting EXIF on. Avoids opening non-images.
+pub fn is_image_ext(ext: &str) -> bool {
+    matches!(
+        ext.to_lowercase().as_str(),
+        "jpg" | "jpeg" | "tif" | "tiff" | "heic" | "heif" | "png" | "webp" | "dng" | "cr2"
+            | "nef" | "arw" | "raf" | "rw2" | "orf"
+    )
+}
 
 fn systime_to_local(t: std::time::SystemTime) -> DateTime<Local> {
     DateTime::<Local>::from(t)
