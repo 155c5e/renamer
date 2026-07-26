@@ -7,12 +7,16 @@ use walkdir::WalkDir;
 use crate::metadata::{self, FileMeta};
 use crate::template::Template;
 
-/// Shared, lock-free progress counters for a long-running scan/apply, so the
-/// GUI thread can render a progress bar while a worker thread does the I/O.
+/// Shared progress counters for a long-running scan/apply, so the GUI thread can
+/// render a progress bar while a worker thread does the I/O.
+///
+/// The counters are lock-free; only the human-readable stage label takes a mutex,
+/// and that is written once per stage rather than once per file.
 #[derive(Default)]
 pub struct Progress {
     pub total: AtomicUsize,
     pub done: AtomicUsize,
+    stage: std::sync::Mutex<String>,
 }
 
 impl Progress {
@@ -28,6 +32,23 @@ impl Progress {
             self.done.load(Ordering::Relaxed),
             self.total.load(Ordering::Relaxed),
         )
+    }
+
+    /// Begin a named stage, resetting the counters. Multi-stage work (indexing
+    /// walks, then hashes, then decodes) reports each stage separately rather
+    /// than showing one meaningless aggregate bar.
+    pub fn start_stage(&self, name: &str, total: usize) {
+        if let Ok(mut s) = self.stage.lock() {
+            s.clear();
+            s.push_str(name);
+        }
+        self.done.store(0, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+    }
+
+    /// Current stage label, empty when none was set.
+    pub fn stage(&self) -> String {
+        self.stage.lock().map(|s| s.clone()).unwrap_or_default()
     }
 }
 

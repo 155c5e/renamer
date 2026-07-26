@@ -1,19 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod catalog;
+mod dupes;
 mod engine;
+mod hashing;
+mod indexer;
 mod metadata;
+mod paths;
 mod pcloud;
+mod quarantine;
 mod template;
+mod thumbs;
 
 use app::RenamerApp;
 
 fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([920.0, 640.0])
-            .with_min_inner_size([640.0, 400.0])
-            .with_title("Renamer"),
+            .with_inner_size([1040.0, 720.0])
+            .with_min_inner_size([700.0, 460.0])
+            .with_title("Renamer — photo library organizer"),
         ..Default::default()
     };
     eframe::run_native(

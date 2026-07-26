@@ -1,8 +1,8 @@
 [package]
 name = "renamer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Bulk file renamer and organizer with metadata-driven templates"
+description = "Photo library organizer: catalog, duplicate detection, and metadata-driven bulk renaming"
 
 [dependencies]
 eframe = "0.29"
@@ -16,6 +16,21 @@ walkdir = "2"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Catalog: bundled SQLite so no system libsqlite3 is required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Content hashing for exact-duplicate detection.
+blake3 = "1"
+# Decoding for perceptual hashes + thumbnails.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+    "gif",
+    "bmp",
+    "tiff",
+    "webp",
+] }
+# NOTE: platform data/cache directory resolution is hand-rolled in src/paths.rs
+# rather than pulling in a crate for ~30 lines of env-var logic.
 
 [profile.release]
 opt-level = 2
