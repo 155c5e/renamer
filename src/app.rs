@@ -5,7 +5,8 @@ use std::sync::Arc;
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::catalog::{Catalog, CatalogStats};
+use crate::catalog::{Catalog, CatalogStats, MediaRow, Visibility};
+use crate::colour;
 use crate::dupes::{self, DupConfig, DupGroup, DupKind, DupReport};
 use crate::engine::{self, Plan, Progress, RowStatus, Settings, UndoEntry};
 use crate::indexer::{self, IndexConfig, IndexOutcome};
@@ -18,8 +19,25 @@ use crate::thumbs;
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Library,
+    Images,
     Duplicates,
     Rename,
+}
+
+/// Whether the parent filter starts enabled.
+///
+/// It does. Forgetting to switch it *on* shows people the photos you meant to
+/// hide; forgetting to switch it *off* is a moment's confusion. Only one of
+/// those is worth protecting against.
+const PARENT_FILTER_DEFAULT: bool = true;
+
+/// Ordering for the image list.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum SortBy {
+    Path,
+    Date,
+    Size,
+    Colour,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -32,6 +50,7 @@ enum Mode {
 enum BgResult {
     // --- library / duplicates ---
     Index(Result<IndexOutcome, String>),
+    Images(Result<Vec<MediaRow>, String>),
     Dupes(Result<DupReport, String>),
     Quarantined(QuarantineOutcome),
     Restored {
@@ -88,6 +107,17 @@ pub struct RenamerApp {
     stats: Option<CatalogStats>,
     last_index: Option<IndexOutcome>,
 
+    // --- parent filter, app-wide ---
+    /// When on, hidden images are excluded from every view that reads the
+    /// catalog. Enforced by [`Visibility`] at the query layer, not per view.
+    parent_filter: bool,
+    hidden_count: usize,
+
+    // --- images ---
+    images: Vec<MediaRow>,
+    image_filter: String,
+    sort_by: SortBy,
+
     // --- duplicates ---
     dup_cfg: DupConfig,
     report: Option<DupReport>,
@@ -137,6 +167,11 @@ impl Default for RenamerApp {
             lib_images_only: true,
             stats: None,
             last_index: None,
+            parent_filter: PARENT_FILTER_DEFAULT,
+            hidden_count: 0,
+            images: Vec::new(),
+            image_filter: String::new(),
+            sort_by: SortBy::Path,
             dup_cfg: DupConfig::default(),
             report: None,
             selections: Vec::new(),
@@ -182,6 +217,19 @@ impl RenamerApp {
 
     // ---- library actions ----
 
+    /// The single place the parent filter turns into a query decision.
+    ///
+    /// Every catalog read that feeds a view goes through this, which is what
+    /// makes the filter app-wide: no view can accidentally opt out, because no
+    /// view chooses for itself.
+    fn visibility(&self) -> Visibility {
+        if self.parent_filter {
+            Visibility::VisibleOnly
+        } else {
+            Visibility::All
+        }
+    }
+
     /// Refresh cached counters. Cheap aggregate queries, run on events rather
     /// than per frame.
     fn refresh_stats(&mut self) {
@@ -190,6 +238,7 @@ impl RenamerApp {
         };
         if let Some(root) = &self.library {
             self.stats = cat.stats_under(root).ok();
+            self.hidden_count = cat.hidden_count_under(root).unwrap_or(0);
         }
         self.restorable_batch = cat.latest_restorable_batch().ok().flatten();
         self.quarantine_bytes = quarantine::quarantine_size();
@@ -226,15 +275,108 @@ impl RenamerApp {
             return;
         };
         let cfg = self.dup_cfg;
+        // Hidden images must not surface in duplicate groups either — that would
+        // be a side door straight past the parent filter.
+        let visibility = self.visibility();
         let (tx, _p, ctx) = self.start_worker(ctx, "Finding duplicates");
         std::thread::spawn(move || {
             let res = Catalog::open_default()
-                .and_then(|cat| cat.present_under(&root))
+                .and_then(|cat| cat.present_under(&root, visibility))
                 .map_err(|e| e.to_string())
                 .map(|rows| dupes::find_duplicates(&rows, &cfg));
             let _ = tx.send(BgResult::Dupes(res));
             ctx.request_repaint();
         });
+    }
+
+    fn do_load_images(&mut self, ctx: &egui::Context) {
+        let Some(root) = self.library.clone() else {
+            self.message = "Index a library first.".to_string();
+            return;
+        };
+        let visibility = self.visibility();
+        let (tx, _p, ctx) = self.start_worker(ctx, "Loading images");
+        std::thread::spawn(move || {
+            let res = Catalog::open_default()
+                .and_then(|cat| cat.present_under(&root, visibility))
+                .map_err(|e| e.to_string());
+            let _ = tx.send(BgResult::Images(res));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Hide or unhide one image.
+    ///
+    /// Runs inline rather than on a worker: it is a single row write, plus at
+    /// most one content hash for a file that has never needed one.
+    fn set_hidden(&mut self, row_index: usize, hidden: bool) {
+        let Some(row) = self.images.get(row_index).cloned() else {
+            return;
+        };
+        let Ok(cat) = Catalog::open_default() else {
+            self.message = "Could not open the catalog.".to_string();
+            return;
+        };
+        match indexer::ensure_content_hash(&cat, &row) {
+            Ok(hash) => match cat.set_hidden(&hash, hidden) {
+                Ok(()) => {
+                    self.images[row_index].hidden = hidden;
+                    self.message = format!(
+                        "{} {}",
+                        if hidden { "Hidden:" } else { "Unhidden:" },
+                        row.file_name
+                    );
+                    // Byte-identical copies share user metadata, so reflect that
+                    // in the list rather than waiting for a reload.
+                    for other in self.images.iter_mut() {
+                        if other.content_hash.is_some()
+                            && other.content_hash == Some(hash.clone())
+                        {
+                            other.hidden = hidden;
+                        }
+                    }
+                    self.refresh_stats();
+                }
+                Err(e) => self.message = format!("Could not update: {e}"),
+            },
+            Err(e) => self.message = format!("Could not hash for tagging: {e}"),
+        }
+    }
+
+    /// Rows to show in the image list, filtered by text and ordered.
+    fn visible_images(&self) -> Vec<usize> {
+        let needle = self.image_filter.trim().to_lowercase();
+        let mut idx: Vec<usize> = self
+            .images
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                needle.is_empty() || r.path.to_string_lossy().to_lowercase().contains(&needle)
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        match self.sort_by {
+            SortBy::Path => idx.sort_by(|&a, &b| self.images[a].path.cmp(&self.images[b].path)),
+            SortBy::Date => idx.sort_by(|&a, &b| {
+                let key = |r: &MediaRow| r.date_taken.unwrap_or(r.mtime);
+                key(&self.images[a])
+                    .cmp(&key(&self.images[b]))
+                    .then_with(|| self.images[a].path.cmp(&self.images[b].path))
+            }),
+            SortBy::Size => idx.sort_by(|&a, &b| {
+                self.images[b]
+                    .size
+                    .cmp(&self.images[a].size)
+                    .then_with(|| self.images[a].path.cmp(&self.images[b].path))
+            }),
+            SortBy::Colour => idx.sort_by(|&a, &b| {
+                colour::hue_sort_key(self.images[a].dom_color)
+                    .cmp(&colour::hue_sort_key(self.images[b].dom_color))
+                    .then_with(|| self.images[a].path.cmp(&self.images[b].path))
+            }),
+        }
+        idx
     }
 
     /// Paths the current selection would quarantine: every enabled group's
@@ -348,6 +490,10 @@ impl RenamerApp {
             let undo = engine::apply_plan_progress(&mut plan, &progress);
             let log_err =
                 root.and_then(|r| engine::write_undo_log(&r, &undo).err().map(|e| e.to_string()));
+            // Follow the moved files in the catalog. Without this the next index
+            // sees a vanished file and a new one, discarding the hashes and
+            // colour of a file whose bytes never changed.
+            follow_moves(undo.iter().map(|e| (e.from.clone(), e.to.clone())));
             let _ = tx.send(BgResult::Apply {
                 plan,
                 undo,
@@ -370,6 +516,8 @@ impl RenamerApp {
             if let Some(r) = root {
                 engine::clear_undo_log(&r);
             }
+            // Undo moves files back, so the catalog has to follow them back too.
+            follow_moves(entries.iter().map(|e| (e.to.clone(), e.from.clone())));
             let _ = tx.send(BgResult::Undo { reverted, errors });
             ctx.request_repaint();
         });
@@ -469,12 +617,27 @@ impl RenamerApp {
                 self.message = outcome.summary();
                 self.stats = Some(outcome.stats);
                 self.last_index = Some(outcome);
-                // Any cached duplicate report is stale once the index moves.
+                // Any cached duplicate report or image list is stale once the
+                // index moves.
                 self.report = None;
                 self.selections.clear();
+                self.images.clear();
                 self.refresh_stats();
             }
             BgResult::Index(Err(e)) => self.message = format!("Index failed: {e}"),
+            BgResult::Images(Ok(rows)) => {
+                self.message = format!(
+                    "{} image(s){}.",
+                    rows.len(),
+                    if self.parent_filter && self.hidden_count > 0 {
+                        format!(", {} hidden by the parent filter", self.hidden_count)
+                    } else {
+                        String::new()
+                    }
+                );
+                self.images = rows;
+            }
+            BgResult::Images(Err(e)) => self.message = format!("Could not load images: {e}"),
             BgResult::Dupes(Ok(report)) => {
                 self.selections = report
                     .groups
@@ -659,6 +822,21 @@ fn undo_summary(reverted: usize, errors: &[String]) -> String {
     }
 }
 
+/// Update catalog paths after the app moved files, so rows (and everything
+/// expensive attached to them) follow their files instead of being rebuilt.
+///
+/// Best-effort and deliberately silent: a rename outside any indexed library is
+/// the normal case, and it simply updates nothing.
+fn follow_moves(moves: impl Iterator<Item = (PathBuf, PathBuf)>) {
+    let moves: Vec<(PathBuf, PathBuf)> = moves.collect();
+    if moves.is_empty() {
+        return;
+    }
+    if let Ok(mut cat) = Catalog::open_default() {
+        let _ = cat.apply_moves(&moves);
+    }
+}
+
 /// Human-readable byte count, e.g. `1.4 GB`.
 pub fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
@@ -685,8 +863,38 @@ impl eframe::App for RenamerApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Library, "Library");
+                ui.selectable_value(&mut self.tab, Tab::Images, "Images");
                 ui.selectable_value(&mut self.tab, Tab::Duplicates, "Duplicates");
                 ui.selectable_value(&mut self.tab, Tab::Rename, "Rename");
+
+                // The parent filter lives in the tab bar, not inside a tab: it
+                // applies everywhere, and its state must be obvious at a glance
+                // before handing someone the screen.
+                ui.separator();
+                let was = self.parent_filter;
+                ui.checkbox(&mut self.parent_filter, "Parent filter")
+                    .on_hover_text(
+                        "Hides images you have marked as hidden, everywhere in the app. \
+                         A display filter, not security — the files are still on disk \
+                         under their real names.",
+                    );
+                if self.parent_filter != was {
+                    // Everything derived from a catalog read is now filtered
+                    // differently, so drop it rather than show stale rows.
+                    self.images.clear();
+                    self.report = None;
+                    self.selections.clear();
+                    self.message = if self.parent_filter {
+                        format!("Parent filter on — {} image(s) hidden.", self.hidden_count)
+                    } else {
+                        "Parent filter off — showing everything.".to_string()
+                    };
+                }
+                if self.parent_filter {
+                    ui.colored_label(egui::Color32::from_rgb(120, 200, 120), "● on");
+                } else {
+                    ui.colored_label(egui::Color32::from_rgb(240, 180, 60), "○ off");
+                }
             });
             ui.add_space(2.0);
         });
@@ -727,6 +935,7 @@ impl eframe::App for RenamerApp {
 
         match self.tab {
             Tab::Library => self.library_tab(ctx, busy),
+            Tab::Images => self.images_tab(ctx, busy),
             Tab::Duplicates => self.duplicates_tab(ctx, busy),
             Tab::Rename => self.rename_tab(ctx, busy),
         }
@@ -870,6 +1079,104 @@ impl RenamerApp {
                     }
                 });
             });
+        });
+    }
+
+    // ---- Images tab ----
+
+    fn images_tab(&mut self, ctx: &egui::Context, busy: bool) {
+        egui::TopBottomPanel::top("image_controls").show(ctx, |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(self.library.is_some(), egui::Button::new("Load images"))
+                        .clicked()
+                    {
+                        self.do_load_images(ctx);
+                    }
+                    ui.label("Sort:");
+                    ui.selectable_value(&mut self.sort_by, SortBy::Path, "Path");
+                    ui.selectable_value(&mut self.sort_by, SortBy::Date, "Date");
+                    ui.selectable_value(&mut self.sort_by, SortBy::Size, "Size");
+                    ui.selectable_value(&mut self.sort_by, SortBy::Colour, "Colour")
+                        .on_hover_text(
+                            "Arranges by hue into a rainbow. Greyscale images collect at \
+                             the end, since they have no meaningful hue.",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.image_filter)
+                            .desired_width(280.0)
+                            .hint_text("path contains…"),
+                    );
+                    if self.parent_filter && self.hidden_count > 0 {
+                        ui.small(format!(
+                            "{} image(s) hidden — turn off the parent filter to manage them.",
+                            self.hidden_count
+                        ));
+                    }
+                });
+                ui.add_space(2.0);
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.images.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label("No images loaded. Index a library, then click “Load images”.");
+                });
+                return;
+            }
+
+            let order = self.visible_images();
+            let mut toggle: Option<(usize, bool)> = None;
+
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                for &i in &order {
+                    let row = &self.images[i];
+                    ui.horizontal(|ui| {
+                        // Colour swatch, so the colour sort is legible.
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(18.0, 18.0),
+                            egui::Sense::hover(),
+                        );
+                        if let Some(c) = row.dom_color {
+                            let (r, g, b) = colour::unpack(c);
+                            ui.painter().rect_filled(
+                                rect,
+                                2.0,
+                                egui::Color32::from_rgb(r, g, b),
+                            );
+                        }
+
+                        let mut hidden = row.hidden;
+                        if ui
+                            .checkbox(&mut hidden, "hide")
+                            .on_hover_text("Hide this image everywhere while the parent filter is on")
+                            .changed()
+                        {
+                            toggle = Some((i, hidden));
+                        }
+
+                        ui.monospace(format!("{:>9}", human_bytes(row.size)));
+                        let dims = match (row.width, row.height) {
+                            (Some(w), Some(h)) => format!("{w}×{h}"),
+                            _ => "—".to_string(),
+                        };
+                        ui.monospace(format!("{dims:>11}"));
+                        let text = egui::RichText::new(row.path.display().to_string());
+                        ui.label(if row.hidden { text.weak() } else { text });
+                    });
+                }
+            });
+
+            // Applied after the loop so the list is not mutated mid-iteration.
+            if let Some((i, hidden)) = toggle {
+                self.set_hidden(i, hidden);
+            }
         });
     }
 
@@ -1370,6 +1677,109 @@ mod tests {
             );
         }
         assert_eq!(selected.len(), 3, "one non-keeper per group");
+    }
+
+    fn img(path: &str, size: u64, dom: Option<u32>, taken: Option<i64>) -> MediaRow {
+        MediaRow {
+            path: PathBuf::from(path),
+            file_name: path.rsplit('/').next().unwrap_or(path).to_string(),
+            size,
+            dom_color: dom,
+            date_taken: taken,
+            ..MediaRow::default()
+        }
+    }
+
+    fn names(app: &RenamerApp) -> Vec<String> {
+        app.visible_images()
+            .into_iter()
+            .map(|i| app.images[i].file_name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn parent_filter_maps_to_query_visibility() {
+        let mut app = RenamerApp::default();
+        // The default matters: forgetting to switch the filter on is the
+        // failure worth protecting against.
+        assert!(app.parent_filter, "parent filter defaults to on");
+        assert_eq!(app.visibility(), Visibility::VisibleOnly);
+
+        app.parent_filter = false;
+        assert_eq!(app.visibility(), Visibility::All);
+    }
+
+    #[test]
+    fn colour_sort_arranges_by_hue_with_greys_last() {
+        let mut app = RenamerApp::default();
+        app.sort_by = SortBy::Colour;
+        app.images = vec![
+            img("/l/grey.jpg", 1, Some(colour::pack(128, 128, 128)), None),
+            img("/l/blue.jpg", 1, Some(colour::pack(0, 0, 255)), None),
+            img("/l/none.jpg", 1, None, None),
+            img("/l/red.jpg", 1, Some(colour::pack(255, 0, 0)), None),
+            img("/l/green.jpg", 1, Some(colour::pack(0, 255, 0)), None),
+        ];
+        assert_eq!(
+            names(&app),
+            vec!["red.jpg", "green.jpg", "blue.jpg", "grey.jpg", "none.jpg"]
+        );
+    }
+
+    #[test]
+    fn other_sorts_behave() {
+        let mut app = RenamerApp::default();
+        app.images = vec![
+            img("/l/c.jpg", 300, None, Some(30)),
+            img("/l/a.jpg", 100, None, Some(10)),
+            img("/l/b.jpg", 200, None, Some(20)),
+        ];
+
+        app.sort_by = SortBy::Path;
+        assert_eq!(names(&app), vec!["a.jpg", "b.jpg", "c.jpg"]);
+
+        app.sort_by = SortBy::Date;
+        assert_eq!(names(&app), vec!["a.jpg", "b.jpg", "c.jpg"]);
+
+        // Size sorts largest first — that is what you want when reclaiming space.
+        app.sort_by = SortBy::Size;
+        assert_eq!(names(&app), vec!["c.jpg", "b.jpg", "a.jpg"]);
+    }
+
+    #[test]
+    fn text_filter_matches_anywhere_in_the_path_case_insensitively() {
+        let mut app = RenamerApp::default();
+        app.images = vec![
+            img("/lib/2019/Holiday.jpg", 1, None, None),
+            img("/lib/2020/work.jpg", 1, None, None),
+        ];
+        app.image_filter = "HOLI".to_string();
+        assert_eq!(names(&app), vec!["Holiday.jpg"]);
+
+        app.image_filter = "2020".to_string();
+        assert_eq!(names(&app), vec!["work.jpg"]);
+
+        app.image_filter = "  ".to_string();
+        assert_eq!(names(&app).len(), 2, "blank filter matches everything");
+    }
+
+    #[test]
+    fn toggling_the_parent_filter_discards_views_built_under_the_old_setting() {
+        // Stale rows fetched with the filter off must not linger on screen after
+        // it is switched on.
+        let mut app = app_with_report(&[DupKind::Exact]);
+        app.images = vec![img("/l/a.jpg", 1, None, None)];
+        assert!(app.report.is_some());
+
+        // Mirrors what the tab-bar checkbox does on change.
+        app.parent_filter = true;
+        app.images.clear();
+        app.report = None;
+        app.selections.clear();
+
+        assert!(app.images.is_empty());
+        assert!(app.report.is_none());
+        assert!(app.selected_for_quarantine().is_empty());
     }
 
     #[test]

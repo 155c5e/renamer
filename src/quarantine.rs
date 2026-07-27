@@ -225,7 +225,7 @@ fn move_file(from: &Path, to: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::MediaRow;
+    use crate::catalog::{MediaRow, Visibility};
 
     struct Fixture {
         _tmp: PathBuf,
@@ -297,7 +297,7 @@ mod tests {
         assert!(keep.exists(), "keeper must never be touched");
         assert!(quarantine_size() >= 8, "file is preserved, not deleted");
         // And dropped from the catalog, since it is no longer in the library.
-        assert_eq!(f.catalog.all_present().unwrap().len(), 1);
+        assert_eq!(f.catalog.all_present(Visibility::All).unwrap().len(), 1);
 
         let (restored, errors) = restore_batch(&f.catalog, batch, &Progress::default());
         assert_eq!(restored, 1);

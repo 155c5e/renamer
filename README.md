@@ -2,13 +2,18 @@
 
 Photo library organizer. GUI frontend (egui), Linux + macOS.
 
-Three tools over one catalog:
+Four tools over one catalog:
 
-- **Library** — index a folder once; metadata, hashes and thumbnails are cached
-  so later scans only touch files that changed.
+- **Library** — index a folder once; metadata, hashes, colours and thumbnails
+  are cached so later scans only touch files that changed.
+- **Images** — browse the catalogue, sort by path, date, size or colour, and
+  mark images hidden.
 - **Duplicates** — find identical files, near-duplicates (the same picture at a
   different size or quality), and burst runs. Removal is reversible.
 - **Rename** — the metadata-driven bulk renamer, with local and pCloud modes.
+
+A **parent filter** in the tab bar hides marked images across every view at
+once.
 
 ## Download
 
@@ -55,15 +60,16 @@ cheapest first, so expensive work only happens where it is needed:
 3. **Hash** — BLAKE3 content hashes, but *only* for files that share a size with
    another file. A file with a unique size cannot be a byte-duplicate of
    anything, so on a typical library most files are never read at all.
-4. **Analyse** — decode each image once to produce both a perceptual hash and a
-   thumbnail. The slow stage on a first run; cached forever after.
+4. **Analyse** — decode each image once to produce a perceptual hash, its
+   dominant colour, and a thumbnail. The slow stage on a first run; cached
+   forever after.
 
 | Option | Effect |
 |--------|--------|
 | Recurse subfolders | Descend into subdirectories |
 | Images only | Ignore files that are not recognizable images |
 | Read EXIF | Capture date, camera, lens. Reads file contents |
-| Analyse images | Perceptual hashes + thumbnails. Required for near-duplicate detection |
+| Analyse images | Perceptual hashes, dominant colour, thumbnails. Required for near-duplicate detection and colour sort |
 
 ## Nothing is written into your picture folders
 
@@ -83,6 +89,44 @@ instant rename instead of a copy.
 The thumbnail cache is purely regenerable and safe to delete at any time (there
 is a button for it). The catalog and quarantine are not — they hold your index
 and your not-yet-deleted files.
+
+---
+
+# Images
+
+Browse what has been catalogued. Sort by **path**, **date**, **size**, or
+**colour** — colour arranges the library by hue into a rainbow, with greyscale
+images collected at the end rather than scattered through the spectrum on
+meaningless hue values.
+
+Dominant colour is found by k-means over a downsampled copy of each image,
+taking the largest cluster. Averaging pixels instead would turn every photo the
+same muddy brown — average a red sunset against a blue sea and you get grey.
+
+The swatch beside each row is that dominant colour.
+
+## Hiding images and the parent filter
+
+Tick **hide** on any image to mark it hidden. The **Parent filter** checkbox in
+the tab bar then excludes every hidden image from every view — the image list,
+duplicate groups, everything that reads the catalog.
+
+It is enforced in one place: the catalog query layer takes a visibility argument
+that no caller can skip. Views do not filter for themselves, because sooner or
+later one of them would forget, and the failure mode here is showing the exact
+thing you meant to hide.
+
+The filter **starts on** each launch, for the same reason.
+
+Two things worth being clear about:
+
+- **It is a display filter, not security.** The files are still on disk, under
+  their real names, unencrypted. Anyone with a file manager can see them.
+- **Byte-identical copies share the flag.** Hiding one hides all of them, since
+  they are the same picture.
+
+Hidden-ness is stored against the image's *content hash*, not its path, so it
+survives renaming, moving, and re-importing the file. See below.
 
 ---
 
@@ -211,6 +255,10 @@ scans and never gets renamed itself.
 Note this one log *does* live in the output folder, unlike the catalog: it is
 deliberately tied to the folder it describes, so moving that folder to another
 machine carries its undo history along.
+
+Renaming also updates the catalog, so a renamed file keeps its existing row —
+along with its hashes, colour and thumbnail — instead of looking like one file
+vanishing and another appearing, which would force a needless re-decode.
 
 ## pCloud mode
 

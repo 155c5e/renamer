@@ -2,6 +2,7 @@
 
 mod app;
 mod catalog;
+mod colour;
 mod dupes;
 mod engine;
 mod hashing;

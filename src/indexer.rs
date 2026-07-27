@@ -10,9 +10,13 @@
 //! 3. **Content hashes** — only for files that share a size with another file.
 //!    Files with a unique size cannot be byte-duplicates of anything, so on a
 //!    typical library the great majority are never read at all.
-//! 4. **Decode** — perceptual hash and thumbnail, from a single decode per file,
-//!    across all cores. Optional, because it is the only stage that must read
-//!    every image in full.
+//! 4. **Decode** — perceptual hash, dominant colour and thumbnail, all from a
+//!    single decode per file, across all cores. Optional, because it is the only
+//!    stage that must read every image in full.
+//!
+//! Anything else needing per-pixel access belongs in stage 4 alongside the rest.
+//! Adding a separate pass later means re-reading and re-decoding the whole
+//! library; adding it here is close to free.
 //!
 //! Stage 4 is the reason indexing is worth caching: everything it produces is
 //! stored in the catalog and the thumbnail cache, so it happens once per file per
@@ -192,9 +196,9 @@ pub fn index_library(
         Err(e) => out.errors.push(format!("hash query: {e}")),
     }
 
-    // ---- stage 4: decode once for perceptual hash + thumbnail ----
+    // ---- stage 4: decode once for perceptual hash, colour and thumbnail ----
     if cfg.compute_phash {
-        match catalog.rows_needing_phash() {
+        match catalog.rows_needing_analysis() {
             Ok(work) => {
                 let work: Vec<(i64, PathBuf)> = work
                     .into_iter()
@@ -203,7 +207,7 @@ pub fn index_library(
                 progress.start_stage("Analysing images", work.len());
                 run_decode_pass(catalog, &work, progress, &mut out);
             }
-            Err(e) => out.errors.push(format!("phash query: {e}")),
+            Err(e) => out.errors.push(format!("analysis query: {e}")),
         }
     }
 
@@ -214,10 +218,12 @@ pub fn index_library(
     out
 }
 
-/// Result of decoding one image.
+/// Everything one decode produces.
 struct Decoded {
     id: i64,
     phash: Option<u64>,
+    /// Dominant colour, packed `0xRRGGBB`.
+    dom_color: Option<u32>,
     /// True pixel dimensions, measured rather than taken from EXIF.
     dims: Option<(u32, u32)>,
     thumb_written: bool,
@@ -277,8 +283,8 @@ fn run_decode_pass(
             if done.phash.is_some() {
                 out.phashed += 1;
             }
-            if let Err(e) = catalog.set_phash(done.id, done.phash) {
-                out.errors.push(format!("phash write: {e}"));
+            if let Err(e) = catalog.set_analysis(done.id, done.phash, done.dom_color) {
+                out.errors.push(format!("analysis write: {e}"));
             }
             if let Some((w, h)) = done.dims {
                 if let Err(e) = catalog.set_dimensions(done.id, w, h) {
@@ -296,6 +302,7 @@ fn decode_one(id: i64, path: &Path) -> Decoded {
             return Decoded {
                 id,
                 phash: None,
+                dom_color: None,
                 dims: None,
                 thumb_written: false,
                 error: Some(format!("{}: {e}", path.display())),
@@ -311,6 +318,7 @@ fn decode_one(id: i64, path: &Path) -> Decoded {
             return Decoded {
                 id,
                 phash: None,
+                dom_color: None,
                 dims: None,
                 thumb_written: false,
                 error: None,
@@ -318,7 +326,10 @@ fn decode_one(id: i64, path: &Path) -> Decoded {
         }
     };
 
+    // One decode, four derived products. Adding any of these as a separate pass
+    // later would mean re-reading and re-decoding the entire library.
     let phash = Some(hashing::perceptual_hash_from_image(&img));
+    let dom_color = Some(crate::colour::dominant_colour(&img));
     let dims = Some((img.width(), img.height()));
     // Same decode feeds the thumbnail, so a first index pays for one decode.
     let mut thumb_written = false;
@@ -333,10 +344,29 @@ fn decode_one(id: i64, path: &Path) -> Decoded {
     Decoded {
         id,
         phash,
+        dom_color,
         dims,
         thumb_written,
         error,
     }
+}
+
+/// Content hash for `row`, computing and storing it if absent.
+///
+/// User-assigned metadata is keyed on content hash so it survives renames, but
+/// the indexer only hashes files that share a size with another. Tagging a file
+/// is therefore the moment its hash has to exist, so it is computed on demand —
+/// one file read, rather than hashing the whole library up front.
+pub fn ensure_content_hash(catalog: &Catalog, row: &MediaRow) -> Result<String, String> {
+    if let Some(h) = &row.content_hash {
+        return Ok(h.clone());
+    }
+    let hash =
+        hashing::content_hash(&row.path).map_err(|e| format!("{}: {e}", row.path.display()))?;
+    catalog
+        .set_content_hash(row.id, &hash)
+        .map_err(|e| format!("catalog: {e}"))?;
+    Ok(hash)
 }
 
 /// Files to consider, sorted for deterministic ordering.
@@ -397,13 +427,17 @@ fn to_row(path: &Path, meta: &FileMeta, size: u64, mtime: i64) -> MediaRow {
         // Filled in by later stages.
         content_hash: None,
         phash: None,
+        dom_color: None,
         missing: false,
+        // Owned by `user_meta`, never written through this path.
+        hidden: false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::Visibility;
     use image::{Rgb, RgbImage};
 
     struct Fixture {
@@ -471,7 +505,7 @@ mod tests {
         assert_eq!(out.phashed, 2, "both images analysed");
         assert_eq!(out.thumbs, 2, "thumbnails generated from the same decode");
 
-        let rows = f.catalog.all_present().unwrap();
+        let rows = f.catalog.all_present(Visibility::All).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.phash.is_some()));
         assert!(rows.iter().all(|r| r.width == Some(40)));
@@ -521,7 +555,7 @@ mod tests {
             "only the size-colliding pair is read for hashing"
         );
 
-        let rows = f.catalog.all_present().unwrap();
+        let rows = f.catalog.all_present(Visibility::All).unwrap();
         let hashed: Vec<_> = rows.iter().filter(|r| r.content_hash.is_some()).collect();
         assert_eq!(hashed.len(), 2);
         assert_eq!(hashed[0].content_hash, hashed[1].content_hash);
@@ -545,7 +579,7 @@ mod tests {
         let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
         assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
 
-        let rows = f.catalog.all_present().unwrap();
+        let rows = f.catalog.all_present(Visibility::All).unwrap();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|r| r.phash.is_some()));
 
@@ -567,7 +601,7 @@ mod tests {
         let (f, _g) = fixture("changed");
         let a = f.image("a.png", 32, 32, 1);
         index_library(&f.catalog, &f.cfg(), &Progress::default());
-        let before = f.catalog.all_present().unwrap()[0].phash;
+        let before = f.catalog.all_present(Visibility::All).unwrap()[0].phash;
 
         // Rewrite with different content and a newer mtime.
         std::thread::sleep(std::time::Duration::from_millis(1100));
@@ -579,7 +613,7 @@ mod tests {
 
         let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
         assert_eq!(out.updated, 1, "changed file re-examined");
-        let after = f.catalog.all_present().unwrap()[0].phash;
+        let after = f.catalog.all_present(Visibility::All).unwrap()[0].phash;
         assert!(after.is_some());
         assert_ne!(before, after, "perceptual hash recomputed for new content");
 
@@ -592,13 +626,13 @@ mod tests {
         let a = f.image("a.png", 32, 32, 1);
         f.image("b.png", 40, 40, 2);
         index_library(&f.catalog, &f.cfg(), &Progress::default());
-        assert_eq!(f.catalog.all_present().unwrap().len(), 2);
+        assert_eq!(f.catalog.all_present(Visibility::All).unwrap().len(), 2);
 
         std::fs::remove_file(&a).unwrap();
         let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
         assert_eq!(out.missing, 1);
         assert_eq!(out.scanned, 1);
-        assert_eq!(f.catalog.all_present().unwrap().len(), 1);
+        assert_eq!(f.catalog.all_present(Visibility::All).unwrap().len(), 1);
 
         cleanup(&f);
     }
@@ -644,7 +678,7 @@ mod tests {
         let out = index_library(&f.catalog, &cfg, &Progress::default());
         assert_eq!(out.phashed, 0);
         assert_eq!(out.thumbs, 0);
-        assert!(f.catalog.all_present().unwrap()[0].phash.is_none());
+        assert!(f.catalog.all_present(Visibility::All).unwrap()[0].phash.is_none());
         assert_eq!(thumbs::cache_size(), 0, "no thumbnails written");
 
         cleanup(&f);
@@ -698,6 +732,71 @@ mod tests {
         assert_eq!(out.scanned, 0);
         assert!(out.errors.is_empty());
         assert_eq!(out.stats, CatalogStats::default());
+        cleanup(&f);
+    }
+
+    #[test]
+    fn dominant_colour_comes_out_of_the_same_decode_pass() {
+        let (f, _g) = fixture("colour");
+        // A strongly red image, written as a solid fill.
+        let p = f.library.join("red.png");
+        let mut img = RgbImage::new(48, 48);
+        for (_x, _y, px) in img.enumerate_pixels_mut() {
+            *px = Rgb([210, 25, 30]);
+        }
+        img.save(&p).unwrap();
+
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert!(out.errors.is_empty(), "errors: {:?}", out.errors);
+
+        let rows = f.catalog.all_present(Visibility::All).unwrap();
+        let dom = rows[0].dom_color.expect("colour extracted");
+        let (r, g, b) = crate::colour::unpack(dom);
+        assert!(r > 180 && g < 70 && b < 70, "expected red, got {dom:06X}");
+        // And it arrived alongside the perceptual hash from one decode.
+        assert!(rows[0].phash.is_some());
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn colour_is_backfilled_without_a_full_reindex() {
+        // An image analysed before colour extraction existed: the next index
+        // must fill it in without re-walking or re-hashing everything.
+        let (f, _g) = fixture("backfill");
+        f.image("a.png", 32, 32, 4);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let id = f.catalog.all_present(Visibility::All).unwrap()[0].id;
+        f.catalog.set_analysis(id, Some(9), None).unwrap(); // simulate old catalog
+
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(out.unchanged, 1, "file itself was not re-read");
+        assert!(f.catalog.all_present(Visibility::All).unwrap()[0]
+            .dom_color
+            .is_some());
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn ensure_content_hash_computes_on_demand_and_caches() {
+        // Tagging a file is the moment its hash has to exist, since indexing
+        // only hashes size-colliding files.
+        let (f, _g) = fixture("ondemand");
+        f.image("solo.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let row = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        assert!(row.content_hash.is_none(), "unique size, so never hashed");
+
+        let hash = ensure_content_hash(&f.catalog, &row).unwrap();
+        assert_eq!(hash.len(), 64);
+        // Persisted, so a second call is free and returns the same value.
+        let stored = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        assert_eq!(stored.content_hash.as_deref(), Some(hash.as_str()));
+        assert_eq!(ensure_content_hash(&f.catalog, &stored).unwrap(), hash);
+
         cleanup(&f);
     }
 
