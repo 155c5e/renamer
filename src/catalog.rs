@@ -907,7 +907,16 @@ mod tests {
         assert_eq!(cat.rows_needing_content_hash().unwrap().len(), 1);
 
         assert_eq!(cat.rows_needing_analysis().unwrap().len(), 2);
+        // A row only leaves the analysis work list once the decode pass has
+        // produced *everything*: a perceptual hash alone still leaves the
+        // dominant colour outstanding.
         cat.set_analysis(a, Some(1), None).unwrap();
+        assert_eq!(
+            cat.rows_needing_analysis().unwrap().len(),
+            2,
+            "still missing a colour"
+        );
+        cat.set_analysis(a, Some(1), Some(0x102030)).unwrap();
         assert_eq!(cat.rows_needing_analysis().unwrap().len(), 1);
     }
 
@@ -1057,6 +1066,11 @@ mod tests {
         cat.set_content_hash(id, "same-bytes").unwrap();
         cat.set_hidden("same-bytes", true).unwrap();
 
+        // A second row keeps SQLite's rowid counter above `id`. Without it,
+        // deleting the highest rowid frees it for reuse and the "new" row comes
+        // back with the same id, which would make the assertion below vacuous.
+        cat.upsert_media(&row("/lib/zz-other.jpg", 7, 7)).unwrap();
+
         cat.remove_path(Path::new("/lib/a.jpg")).unwrap();
         let new_id = cat
             .upsert_media(&MediaRow {
@@ -1064,10 +1078,15 @@ mod tests {
                 ..row("/elsewhere/renamed.jpg", 100, 9)
             })
             .unwrap();
-        assert_ne!(new_id, id, "genuinely a new row");
+        assert_ne!(new_id, id, "genuinely a new row, not an update");
 
-        assert!(cat.all_present(Visibility::VisibleOnly).unwrap().is_empty());
-        assert!(cat.all_present(Visibility::All).unwrap()[0].hidden);
+        // The rebuilt row is still hidden: the flag followed the bytes, not the
+        // path or the row id.
+        let visible = cat.all_present(Visibility::VisibleOnly).unwrap();
+        assert_eq!(paths_of(&visible), vec!["/lib/zz-other.jpg"]);
+        let all = cat.all_present(Visibility::All).unwrap();
+        let rebuilt = all.iter().find(|r| r.id == new_id).unwrap();
+        assert!(rebuilt.hidden);
     }
 
     #[test]
