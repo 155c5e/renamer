@@ -9,6 +9,7 @@ Four tools over one catalog:
 - **Images** — browse the catalogue, sort by path, date, size, colour or
   rating, star your keepers, classify photos vs screenshots vs saved images,
   and mark images hidden.
+- **Slideshow** — play the library back, ordered by date, rating or shuffle.
 - **Duplicates** — find identical files, near-duplicates (the same picture at a
   different size or quality), and burst runs. Removal is reversible.
 - **Rename** — the metadata-driven bulk renamer, with local and pCloud modes.
@@ -164,6 +165,34 @@ Two things worth being clear about:
 Like ratings and kind overrides, hidden-ness is stored against the image's
 *content hash*, not its path, so it survives renaming, moving, and re-importing
 the file.
+
+---
+
+# Slideshow
+
+Plays back **exactly what the Images tab is showing** — same text filter, same
+minimum stars, same kind filter, same parent filter. The sequence is built from
+that one list, so there is no second filtering path that could disagree and
+show you something you had excluded.
+
+| Control | |
+|---------|---|
+| `Space` | play / pause |
+| `→` or `N` | next |
+| `←` or `P` | previous |
+| `Esc` | leave fullscreen |
+
+Order can be **as listed**, **date** (oldest first, falling back to modified
+time for images with no capture date), **rating** (best first), or **shuffle**.
+Playback wraps at the end rather than stopping on a blank screen.
+
+Images are decoded on a background thread and downscaled to 2560px before being
+uploaded as a texture, so advancing does not stall the window and a 50-megapixel
+original does not become a 200 MB texture. The previous image stays on screen
+until the next one is ready.
+
+Rating photos and then playing back everything at 4★ and above is the intended
+loop: cull first, then watch.
 
 ---
 

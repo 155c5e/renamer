@@ -808,10 +808,9 @@ mod tests {
     fn reindexing_never_clobbers_user_metadata() {
         // `to_row` builds a MediaRow with inert user-metadata fields, and
         // `upsert_media` ignores them. If either ever changed, re-indexing would
-        // silently wipe ratings and hidden flags — the exact failure the
-        // content-hash keying exists to prevent.
+        // silently wipe ratings and hidden flags.
         use crate::kind::MediaKind;
-        let (f, _g) = fixture("nocloberr");
+        let (f, _g) = fixture("noclobber");
         f.image("a.png", 32, 32, 1);
         index_library(&f.catalog, &f.cfg(), &Progress::default());
 
@@ -821,16 +820,52 @@ mod tests {
         f.catalog.set_hidden(&hash, true).unwrap();
         f.catalog.set_kind(&hash, Some(MediaKind::Saved)).unwrap();
 
-        // Re-index, including after a change that forces the row to be rewritten.
+        // Re-index twice, to catch both the "skipped, unchanged" fast path and
+        // anything that might rewrite the row.
         index_library(&f.catalog, &f.cfg(), &Progress::default());
-        std::thread::sleep(std::time::Duration::from_millis(1100));
-        f.image("a.png", 48, 48, 9); // same path, different bytes and mtime
         index_library(&f.catalog, &f.cfg(), &Progress::default());
 
         let after = &f.catalog.all_present(Visibility::All).unwrap()[0];
-        assert_eq!(after.rating, 5, "rating survived a rewrite");
-        assert!(after.hidden, "hidden flag survived a rewrite");
+        assert_eq!(after.rating, 5, "rating survived re-indexing");
+        assert!(after.hidden, "hidden flag survived re-indexing");
         assert_eq!(after.kind_override, Some(MediaKind::Saved));
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn replacing_a_file_with_different_bytes_does_not_inherit_its_metadata() {
+        // A direct consequence of keying user metadata on content hash: metadata
+        // follows the *bytes*, not the path. Overwrite a photo with a different
+        // image and the new content starts unrated, because as far as the
+        // catalog is concerned it is a different picture that happens to live at
+        // the same path.
+        //
+        // Pinned deliberately. It is the right behaviour for "this path now
+        // holds something else", and arguably the wrong one for "I cropped this
+        // photo and saved over it" — so it should not change by accident.
+        use crate::kind::MediaKind;
+        let (f, _g) = fixture("rebytes");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let row = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        let old_hash = ensure_content_hash(&f.catalog, &row).unwrap();
+        f.catalog.set_rating(&old_hash, 5).unwrap();
+        f.catalog.set_kind(&old_hash, Some(MediaKind::Saved)).unwrap();
+
+        // mtime has one-second resolution, so wait before rewriting.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        f.image("a.png", 48, 48, 9); // same path, different content
+
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+        let after = &f.catalog.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(after.rating, 0, "new content is unrated");
+        assert_eq!(after.kind_override, None);
+
+        // The old rating is not lost, just detached: it still applies to those
+        // bytes should they reappear.
+        assert_eq!(f.catalog.rating_of(&old_hash).unwrap(), 5);
 
         cleanup(&f);
     }

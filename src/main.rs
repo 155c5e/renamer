@@ -12,6 +12,7 @@ mod metadata;
 mod paths;
 mod pcloud;
 mod quarantine;
+mod slideshow;
 mod template;
 mod thumbs;
 

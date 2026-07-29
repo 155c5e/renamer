@@ -513,6 +513,22 @@ impl Catalog {
         self.set_user_meta(content_hash, "kind", kind.map(|k| k.as_str()))
     }
 
+    /// Rating stored against this content hash, regardless of whether any file
+    /// currently has those bytes.
+    #[allow(dead_code)] // asserted by tests; views read the joined column
+    pub fn rating_of(&self, content_hash: &str) -> rusqlite::Result<u8> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT rating FROM user_meta WHERE content_hash = ?1",
+                params![content_hash],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .clamp(0, 5) as u8)
+    }
+
     /// Whether this content hash is hidden.
     #[allow(dead_code)] // asserted by tests; views read the joined column
     pub fn is_hidden(&self, content_hash: &str) -> rusqlite::Result<bool> {
