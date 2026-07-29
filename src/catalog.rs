@@ -25,13 +25,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Current schema version. Bump when altering the schema and add a migration
 /// step in [`Catalog::migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Columns selected by the `present_*` queries, in the order [`read_media_row`]
 /// expects. Kept in one place so the call sites cannot drift apart.
 const MEDIA_COLUMNS: &str = "m.id, m.path, m.file_name, m.ext, m.size, m.mtime, m.date_taken, \
      m.camera_make, m.camera_model, m.lens, m.iso, m.width, m.height, m.content_hash, \
-     m.phash, m.missing, m.dom_color, COALESCE(u.hidden, 0)";
+     m.phash, m.missing, m.dom_color, COALESCE(u.hidden, 0), COALESCE(u.rating, 0), u.kind";
 
 /// Whether a query should include images the user has hidden.
 ///
@@ -92,6 +92,11 @@ pub struct MediaRow {
     /// Hidden by the user (the parent filter). Read-only here: it lives in
     /// `user_meta`, keyed on content hash, and is joined in.
     pub hidden: bool,
+    /// 0–5 stars; 0 means unrated. Joined from `user_meta`.
+    pub rating: u8,
+    /// User's override of the guessed media kind, if any. `None` means "trust
+    /// the guess" — see [`crate::kind::effective`].
+    pub kind_override: Option<crate::kind::MediaKind>,
 }
 
 /// The minimum needed to decide whether a file must be re-examined.
@@ -214,6 +219,8 @@ impl Catalog {
             CREATE TABLE IF NOT EXISTS user_meta (
                 content_hash TEXT PRIMARY KEY,
                 hidden       INTEGER NOT NULL DEFAULT 0,
+                rating       INTEGER NOT NULL DEFAULT 0,
+                kind         TEXT,
                 updated_at   INTEGER NOT NULL
             );
             "#,
@@ -223,6 +230,11 @@ impl Catalog {
         // so an existing catalog keeps its hashes and thumbnails instead of
         // forcing a full re-index.
         self.add_column_if_missing("media", "dom_color", "INTEGER")?;
+
+        // v2 -> v3: star rating and media-kind override. Both are user-assigned,
+        // so they join `hidden` in `user_meta` keyed on content hash.
+        self.add_column_if_missing("user_meta", "rating", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("user_meta", "kind", "TEXT")?;
 
         self.conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('version', ?1)
@@ -460,18 +472,45 @@ impl Catalog {
 
     // ---- user-assigned metadata ----
 
-    /// Hide or unhide the image with this content hash.
-    pub fn set_hidden(&self, content_hash: &str, hidden: bool) -> rusqlite::Result<()> {
+    /// Set one user-assigned field, leaving the others alone.
+    ///
+    /// `column` is only ever passed an internal constant, never anything from
+    /// the user, so interpolating it into the statement is safe. The values
+    /// themselves stay bound parameters.
+    fn set_user_meta<T: rusqlite::ToSql>(
+        &self,
+        content_hash: &str,
+        column: &str,
+        value: T,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO user_meta (content_hash, hidden, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(content_hash) DO UPDATE SET hidden = ?2, updated_at = ?3",
-            params![
-                content_hash,
-                hidden as i64,
-                chrono::Utc::now().timestamp()
-            ],
+            &format!(
+                "INSERT INTO user_meta (content_hash, {column}, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(content_hash) DO UPDATE SET {column} = ?2, updated_at = ?3"
+            ),
+            params![content_hash, value, chrono::Utc::now().timestamp()],
         )?;
         Ok(())
+    }
+
+    /// Hide or unhide the image with this content hash.
+    pub fn set_hidden(&self, content_hash: &str, hidden: bool) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "hidden", hidden as i64)
+    }
+
+    /// Set a 0–5 star rating; 0 clears it. Values outside the range are clamped
+    /// rather than rejected, so a caller bug cannot poison the database.
+    pub fn set_rating(&self, content_hash: &str, rating: u8) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "rating", rating.min(5) as i64)
+    }
+
+    /// Override the guessed media kind, or pass `None` to go back to the guess.
+    pub fn set_kind(
+        &self,
+        content_hash: &str,
+        kind: Option<crate::kind::MediaKind>,
+    ) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "kind", kind.map(|k| k.as_str()))
     }
 
     /// Whether this content hash is hidden.
@@ -722,6 +761,11 @@ fn read_media_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaRow> {
         missing: r.get::<_, i64>(15)? != 0,
         dom_color: r.get::<_, Option<i64>>(16)?.map(|v| v as u32),
         hidden: r.get::<_, i64>(17)? != 0,
+        rating: r.get::<_, i64>(18)?.clamp(0, 5) as u8,
+        kind_override: r
+            .get::<_, Option<String>>(19)?
+            .as_deref()
+            .and_then(crate::kind::MediaKind::parse),
     })
 }
 
@@ -1266,6 +1310,127 @@ mod tests {
         drop(cat);
         let cat = Catalog::open(&db).unwrap();
         assert_eq!(cat.all_present(Visibility::All).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rating_roundtrips_and_clamps() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 0);
+
+        for stars in 0..=5u8 {
+            cat.set_rating("h", stars).unwrap();
+            assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, stars);
+        }
+        // A caller bug must not poison the database with an impossible rating.
+        cat.set_rating("h", 99).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 5);
+    }
+
+    #[test]
+    fn kind_override_roundtrips_and_clears() {
+        use crate::kind::MediaKind;
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].kind_override, None);
+
+        for k in MediaKind::ALL {
+            cat.set_kind("h", Some(k)).unwrap();
+            assert_eq!(
+                cat.all_present(Visibility::All).unwrap()[0].kind_override,
+                Some(k)
+            );
+        }
+        cat.set_kind("h", None).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].kind_override, None);
+    }
+
+    #[test]
+    fn user_meta_fields_are_independent() {
+        // Each setter writes one column; the others must survive untouched.
+        use crate::kind::MediaKind;
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+
+        cat.set_rating("h", 4).unwrap();
+        cat.set_hidden("h", true).unwrap();
+        cat.set_kind("h", Some(MediaKind::Saved)).unwrap();
+
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.rating, 4);
+        assert!(got.hidden);
+        assert_eq!(got.kind_override, Some(MediaKind::Saved));
+
+        // Changing one still leaves the rest alone.
+        cat.set_hidden("h", false).unwrap();
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.rating, 4);
+        assert!(!got.hidden);
+        assert_eq!(got.kind_override, Some(MediaKind::Saved));
+    }
+
+    #[test]
+    fn ratings_and_kinds_survive_a_rename() {
+        // Same durability guarantee as the hidden flag: keyed on bytes, so the
+        // rename engine cannot lose them.
+        use crate::kind::MediaKind;
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/IMG_1.jpg", 100, 5)).unwrap();
+        cat.set_content_hash(id, "bytes").unwrap();
+        cat.set_rating("bytes", 5).unwrap();
+        cat.set_kind("bytes", Some(MediaKind::Photo)).unwrap();
+
+        cat.apply_moves(&[(
+            PathBuf::from("/lib/IMG_1.jpg"),
+            PathBuf::from("/lib/2019/best.jpg"),
+        )])
+        .unwrap();
+
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.path, PathBuf::from("/lib/2019/best.jpg"));
+        assert_eq!(got.rating, 5);
+        assert_eq!(got.kind_override, Some(MediaKind::Photo));
+    }
+
+    #[test]
+    fn migrating_a_v2_catalog_adds_the_user_meta_columns() {
+        let dir = std::env::temp_dir().join(format!("renamer_migrate_v3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v2.sqlite");
+
+        {
+            // A v2-shaped user_meta: hidden but no rating or kind.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_meta (
+                    content_hash TEXT PRIMARY KEY,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL);
+                 INSERT INTO user_meta (content_hash, hidden, updated_at)
+                 VALUES ('kept', 1, 0);",
+            )
+            .unwrap();
+        }
+
+        let cat = Catalog::open(&db).unwrap();
+        assert_eq!(cat.schema_version().unwrap(), SCHEMA_VERSION);
+        // The existing hidden flag survives, and the new columns default sanely.
+        assert!(cat.is_hidden("kept").unwrap());
+        let id = cat.upsert_media(&row("/lib/a.jpg", 1, 1)).unwrap();
+        cat.set_content_hash(id, "kept").unwrap();
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert!(got.hidden);
+        assert_eq!(got.rating, 0);
+        assert_eq!(got.kind_override, None);
+
+        cat.set_rating("kept", 3).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 3);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

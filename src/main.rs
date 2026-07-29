@@ -7,6 +7,7 @@ mod dupes;
 mod engine;
 mod hashing;
 mod indexer;
+mod kind;
 mod metadata;
 mod paths;
 mod pcloud;
