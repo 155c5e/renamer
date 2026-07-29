@@ -429,8 +429,12 @@ fn to_row(path: &Path, meta: &FileMeta, size: u64, mtime: i64) -> MediaRow {
         phash: None,
         dom_color: None,
         missing: false,
-        // Owned by `user_meta`, never written through this path.
+        // Owned by `user_meta` and joined in at read time. `upsert_media`
+        // ignores these, so the values here are inert — indexing can never
+        // clobber a rating or a hidden flag.
         hidden: false,
+        rating: 0,
+        kind_override: None,
     }
 }
 
@@ -796,6 +800,37 @@ mod tests {
         let stored = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
         assert_eq!(stored.content_hash.as_deref(), Some(hash.as_str()));
         assert_eq!(ensure_content_hash(&f.catalog, &stored).unwrap(), hash);
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn reindexing_never_clobbers_user_metadata() {
+        // `to_row` builds a MediaRow with inert user-metadata fields, and
+        // `upsert_media` ignores them. If either ever changed, re-indexing would
+        // silently wipe ratings and hidden flags — the exact failure the
+        // content-hash keying exists to prevent.
+        use crate::kind::MediaKind;
+        let (f, _g) = fixture("nocloberr");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let row = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        let hash = ensure_content_hash(&f.catalog, &row).unwrap();
+        f.catalog.set_rating(&hash, 5).unwrap();
+        f.catalog.set_hidden(&hash, true).unwrap();
+        f.catalog.set_kind(&hash, Some(MediaKind::Saved)).unwrap();
+
+        // Re-index, including after a change that forces the row to be rewritten.
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        f.image("a.png", 48, 48, 9); // same path, different bytes and mtime
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let after = &f.catalog.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(after.rating, 5, "rating survived a rewrite");
+        assert!(after.hidden, "hidden flag survived a rewrite");
+        assert_eq!(after.kind_override, Some(MediaKind::Saved));
 
         cleanup(&f);
     }
