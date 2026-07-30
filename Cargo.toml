@@ -32,5 +32,16 @@ image = { version = "0.25", default-features = false, features = [
 # NOTE: platform data/cache directory resolution is hand-rolled in src/paths.rs
 # rather than pulling in a crate for ~30 lines of env-var logic.
 
+# Face detection and embedding inference. Pure Rust, so the single-binary
+# distribution survives — `ort` would be faster but links ONNX Runtime's native
+# C++ library, which means shipping a dylib alongside the binary.
+#
+# Model weights are NOT vendored: see docs/face-models.md.
+tract-onnx = "0.23"
+
+# NOTE: the map is rendered from OSM tiles using `ureq` + `image`, both already
+# present, rather than the `walkers` widget. walkers requires egui 0.34 and this
+# app is on 0.29; adding it would link two incompatible egui versions.
+
 [profile.release]
 opt-level = 2

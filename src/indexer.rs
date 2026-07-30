@@ -152,9 +152,15 @@ pub fn index_library(
         let size = fsmeta.len();
         let mtime = mtime_secs(&fsmeta);
 
-        // The fast path that makes rescans cheap.
+        // The fast path that makes rescans cheap. A row stamped with an older
+        // metadata generation is re-examined even though the file has not
+        // changed, so a newly-extracted field (GPS, most recently) reaches
+        // files that were catalogued before it existed.
         if let Some(stamp) = stamps.get(path) {
-            if stamp.size == size && stamp.mtime == mtime {
+            if stamp.size == size
+                && stamp.mtime == mtime
+                && stamp.meta_version == crate::catalog::META_VERSION
+            {
                 seen_ids.push(stamp.id);
                 out.unchanged += 1;
                 continue;
@@ -424,6 +430,8 @@ fn to_row(path: &Path, meta: &FileMeta, size: u64, mtime: i64) -> MediaRow {
         iso: meta.iso.clone(),
         width: meta.width.as_deref().and_then(|s| s.parse().ok()),
         height: meta.height.as_deref().and_then(|s| s.parse().ok()),
+        lat: meta.lat,
+        lon: meta.lon,
         // Filled in by later stages.
         content_hash: None,
         phash: None,
@@ -866,6 +874,38 @@ mod tests {
         // The old rating is not lost, just detached: it still applies to those
         // bytes should they reappear.
         assert_eq!(f.catalog.rating_of(&old_hash).unwrap(), 5);
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn a_stale_metadata_stamp_forces_a_re_read_of_an_unchanged_file() {
+        // The backfill mechanism. Without it, adding a new extracted field
+        // (GPS, most recently) would only ever apply to new and changed files,
+        // leaving an existing library permanently missing it.
+        let (f, _g) = fixture("metaversion");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        // Unchanged: skipped entirely.
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(out.unchanged, 1);
+        assert_eq!(out.updated, 0);
+
+        // Simulate a row written by an older build, without touching the file.
+        f.catalog.mark_meta_stale_for_tests();
+
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(
+            out.updated, 1,
+            "stale stamp must re-read the file even though it is unchanged"
+        );
+        assert_eq!(out.unchanged, 0);
+
+        // And the stamp is brought up to date, so it settles after one pass.
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(out.unchanged, 1);
+        assert_eq!(out.updated, 0);
 
         cleanup(&f);
     }
