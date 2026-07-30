@@ -6,8 +6,10 @@ Four tools over one catalog:
 
 - **Library** — index a folder once; metadata, hashes, colours and thumbnails
   are cached so later scans only touch files that changed.
-- **Images** — browse the catalogue, sort by path, date, size or colour, and
-  mark images hidden.
+- **Images** — browse the catalogue, sort by path, date, size, colour or
+  rating, star your keepers, classify photos vs screenshots vs saved images,
+  and mark images hidden.
+- **Slideshow** — play the library back, ordered by date, rating or shuffle.
 - **Duplicates** — find identical files, near-duplicates (the same picture at a
   different size or quality), and burst runs. Removal is reversible.
 - **Rename** — the metadata-driven bulk renamer, with local and pCloud modes.
@@ -105,6 +107,41 @@ same muddy brown — average a red sunset against a blue sea and you get grey.
 
 The swatch beside each row is that dominant colour.
 
+## Ratings
+
+Click the stars on any row to rate 0–5. Clicking the star that is already the
+rating clears it. Sort by **rating** to put your keepers first, and use the
+**min ★** slider to hide everything below a threshold.
+
+Ratings are stored against the image's *content hash*, so they survive renaming,
+moving and re-importing — including renames done in the Rename tab.
+
+They live in the catalog only. They are not written into the files or into XMP
+sidecars, so Lightroom and digiKam will not see them, and they do not travel with
+the photos to another machine.
+
+## Photos, screenshots and saved images
+
+Not everything in a picture folder is a photograph. Moodboards, inspiration and
+saved reference images have no capture date and no camera, so they distort date
+sorting and add noise to duplicate detection.
+
+Each image is classified automatically:
+
+| Kind | How it is guessed |
+|------|-------------------|
+| **photo** | Has camera metadata — make, model, lens, ISO, or a capture time |
+| **screenshot** | Filename says so, or the dimensions match a common screen size |
+| **saved** | Everything else |
+
+The filename is trusted ahead of dimensions, since plenty of real photos are
+exported at exactly 1920×1080. Use the dropdown on any row to override the guess;
+`auto` puts it back. An overridden kind shows with an asterisk.
+
+**Duplicate detection is scoped by kind.** A saved reference image that happens
+to match a photo you took is not a duplicate — you want both — so the detectors
+only ever group within a single kind.
+
 ## Hiding images and the parent filter
 
 Tick **hide** on any image to mark it hidden. The **Parent filter** checkbox in
@@ -125,8 +162,37 @@ Two things worth being clear about:
 - **Byte-identical copies share the flag.** Hiding one hides all of them, since
   they are the same picture.
 
-Hidden-ness is stored against the image's *content hash*, not its path, so it
-survives renaming, moving, and re-importing the file. See below.
+Like ratings and kind overrides, hidden-ness is stored against the image's
+*content hash*, not its path, so it survives renaming, moving, and re-importing
+the file.
+
+---
+
+# Slideshow
+
+Plays back **exactly what the Images tab is showing** — same text filter, same
+minimum stars, same kind filter, same parent filter. The sequence is built from
+that one list, so there is no second filtering path that could disagree and
+show you something you had excluded.
+
+| Control | |
+|---------|---|
+| `Space` | play / pause |
+| `→` or `N` | next |
+| `←` or `P` | previous |
+| `Esc` | leave fullscreen |
+
+Order can be **as listed**, **date** (oldest first, falling back to modified
+time for images with no capture date), **rating** (best first), or **shuffle**.
+Playback wraps at the end rather than stopping on a blank screen.
+
+Images are decoded on a background thread and downscaled to 2560px before being
+uploaded as a texture, so advancing does not stall the window and a 50-megapixel
+original does not become a 200 MB texture. The previous image stays on screen
+until the next one is ready.
+
+Rating photos and then playing back everything at 4★ and above is the intended
+loop: cull first, then watch.
 
 ---
 

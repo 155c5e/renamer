@@ -60,6 +60,12 @@ pub struct DupConfig {
     pub find_exact: bool,
     pub find_near: bool,
     pub find_burst: bool,
+    /// Only group images of the same kind together.
+    ///
+    /// A saved reference image that happens to match a photograph you took is
+    /// not a duplicate in any useful sense — you want to keep both — so mixing
+    /// the two just adds noise to the review.
+    pub same_kind_only: bool,
 }
 
 impl Default for DupConfig {
@@ -70,6 +76,7 @@ impl Default for DupConfig {
             find_exact: true,
             find_near: true,
             find_burst: false, // opt-in: a burst is intent, not redundancy
+            same_kind_only: true,
         }
     }
 }
@@ -136,6 +143,31 @@ impl DupReport {
 
 /// Find duplicate groups among `rows`.
 pub fn find_duplicates(rows: &[MediaRow], cfg: &DupConfig) -> DupReport {
+    if cfg.same_kind_only {
+        // Partition first, then detect within each kind. Running the detectors
+        // per partition is what keeps a saved image from ever pairing with a
+        // photograph, in every detector at once.
+        let mut buckets: HashMap<crate::kind::MediaKind, Vec<MediaRow>> = HashMap::new();
+        for r in rows {
+            buckets
+                .entry(crate::kind::effective(r))
+                .or_default()
+                .push(r.clone());
+        }
+        let mut kinds: Vec<_> = buckets.into_iter().collect();
+        kinds.sort_by_key(|(k, _)| *k); // deterministic despite HashMap order
+
+        let per_kind = DupConfig {
+            same_kind_only: false,
+            ..*cfg
+        };
+        let mut groups = Vec::new();
+        for (_kind, bucket) in kinds {
+            groups.extend(find_duplicates(&bucket, &per_kind).groups);
+        }
+        return finish(groups);
+    }
+
     let mut groups = Vec::new();
 
     if cfg.find_exact {
@@ -148,14 +180,20 @@ pub fn find_duplicates(rows: &[MediaRow], cfg: &DupConfig) -> DupReport {
         groups.extend(burst_groups(rows, cfg.burst_window_secs));
     }
 
-    // Stable, useful ordering: strongest evidence first, then biggest win.
+    finish(groups)
+}
+
+/// Order the collected groups and wrap them up.
+///
+/// Shared by the partitioned and unpartitioned paths so both produce the same
+/// ordering: strongest evidence first, then biggest win.
+fn finish(mut groups: Vec<DupGroup>) -> DupReport {
     groups.sort_by(|a, b| {
         kind_rank(a.kind)
             .cmp(&kind_rank(b.kind))
             .then(b.reclaimable.cmp(&a.reclaimable))
             .then(a.members[0].path.cmp(&b.members[0].path))
     });
-
     DupReport { groups }
 }
 
@@ -707,6 +745,77 @@ mod tests {
         assert_eq!(rep.groups[0].members.len(), 3);
         assert_eq!(rep.groups[0].reclaimable, 200);
         assert_eq!(rep.total_removable(), 2);
+    }
+
+    #[test]
+    fn saved_images_do_not_group_against_photographs() {
+        use crate::kind::MediaKind;
+        // Byte-identical, but one is a photo you took and one is a reference
+        // image you saved. You want to keep both, so this is not a duplicate.
+        let photo = MediaRow {
+            camera_model: Some("R5".into()),
+            date_taken: Some(1_600_000_000),
+            ..with_hash("/lib/IMG_1.jpg", 100, "same")
+        };
+        let saved = MediaRow {
+            kind_override: Some(MediaKind::Saved),
+            ..with_hash("/lib/inspo/ref.jpg", 100, "same")
+        };
+
+        let rep = find_duplicates(&[photo.clone(), saved.clone()], &DupConfig::default());
+        assert!(
+            rep.is_empty(),
+            "different kinds must not group: {:?}",
+            rep.groups.len()
+        );
+
+        // Turning the scoping off puts them back together, proving the two are
+        // otherwise a perfectly good match.
+        let mixed = DupConfig {
+            same_kind_only: false,
+            ..DupConfig::default()
+        };
+        assert_eq!(find_duplicates(&[photo, saved], &mixed).groups.len(), 1);
+    }
+
+    #[test]
+    fn duplicates_within_one_kind_are_still_found() {
+        use crate::kind::MediaKind;
+        let a = MediaRow {
+            kind_override: Some(MediaKind::Saved),
+            ..with_hash("/lib/a.jpg", 100, "same")
+        };
+        let b = MediaRow {
+            kind_override: Some(MediaKind::Saved),
+            ..with_hash("/lib/b.jpg", 100, "same")
+        };
+        let rep = find_duplicates(&[a, b], &DupConfig::default());
+        assert_eq!(rep.groups.len(), 1);
+        assert_eq!(rep.groups[0].members.len(), 2);
+    }
+
+    #[test]
+    fn kind_scoping_still_finds_groups_in_several_kinds_at_once() {
+        use crate::kind::MediaKind;
+        let saved = |p: &str| MediaRow {
+            kind_override: Some(MediaKind::Saved),
+            ..with_hash(p, 10, "s")
+        };
+        let shot = |p: &str| MediaRow {
+            kind_override: Some(MediaKind::Photo),
+            ..with_hash(p, 5000, "p")
+        };
+        let rows = vec![
+            saved("/lib/s1.jpg"),
+            saved("/lib/s2.jpg"),
+            shot("/lib/p1.jpg"),
+            shot("/lib/p2.jpg"),
+        ];
+        let rep = find_duplicates(&rows, &DupConfig::default());
+        assert_eq!(rep.groups.len(), 2, "one group per kind");
+        // Ordering is still by reclaimable bytes, so the photos come first.
+        assert_eq!(rep.groups[0].reclaimable, 5000);
+        assert_eq!(rep.groups[1].reclaimable, 10);
     }
 
     #[test]

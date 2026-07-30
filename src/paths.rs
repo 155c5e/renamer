@@ -76,6 +76,16 @@ pub fn quarantine_dir() -> PathBuf {
     data_dir().join("quarantine")
 }
 
+/// Where face-recognition ONNX models are looked for.
+///
+/// Not vendored with the app: the usable pretrained weights are licensed for
+/// non-commercial research only, so redistributing them here would relicense
+/// someone else's work by accident. See `docs/face-models.md`.
+#[allow(dead_code)] // referenced by docs; the inference pass is not wired up yet
+pub fn models_dir() -> PathBuf {
+    data_dir().join("models")
+}
+
 /// Create `dir` (and parents) if missing.
 pub fn ensure_dir(dir: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dir)
@@ -115,6 +125,10 @@ mod tests {
         assert_eq!(
             thumbs_dir(),
             PathBuf::from("/tmp/renamer-cache-test/thumbs")
+        );
+        assert_eq!(
+            models_dir(),
+            PathBuf::from("/tmp/renamer-data-test/models")
         );
 
         std::env::remove_var("RENAMER_DATA_DIR");

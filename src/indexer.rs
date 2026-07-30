@@ -152,9 +152,15 @@ pub fn index_library(
         let size = fsmeta.len();
         let mtime = mtime_secs(&fsmeta);
 
-        // The fast path that makes rescans cheap.
+        // The fast path that makes rescans cheap. A row stamped with an older
+        // metadata generation is re-examined even though the file has not
+        // changed, so a newly-extracted field (GPS, most recently) reaches
+        // files that were catalogued before it existed.
         if let Some(stamp) = stamps.get(path) {
-            if stamp.size == size && stamp.mtime == mtime {
+            if stamp.size == size
+                && stamp.mtime == mtime
+                && stamp.meta_version == crate::catalog::META_VERSION
+            {
                 seen_ids.push(stamp.id);
                 out.unchanged += 1;
                 continue;
@@ -424,13 +430,19 @@ fn to_row(path: &Path, meta: &FileMeta, size: u64, mtime: i64) -> MediaRow {
         iso: meta.iso.clone(),
         width: meta.width.as_deref().and_then(|s| s.parse().ok()),
         height: meta.height.as_deref().and_then(|s| s.parse().ok()),
+        lat: meta.lat,
+        lon: meta.lon,
         // Filled in by later stages.
         content_hash: None,
         phash: None,
         dom_color: None,
         missing: false,
-        // Owned by `user_meta`, never written through this path.
+        // Owned by `user_meta` and joined in at read time. `upsert_media`
+        // ignores these, so the values here are inert — indexing can never
+        // clobber a rating or a hidden flag.
         hidden: false,
+        rating: 0,
+        kind_override: None,
     }
 }
 
@@ -796,6 +808,104 @@ mod tests {
         let stored = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
         assert_eq!(stored.content_hash.as_deref(), Some(hash.as_str()));
         assert_eq!(ensure_content_hash(&f.catalog, &stored).unwrap(), hash);
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn reindexing_never_clobbers_user_metadata() {
+        // `to_row` builds a MediaRow with inert user-metadata fields, and
+        // `upsert_media` ignores them. If either ever changed, re-indexing would
+        // silently wipe ratings and hidden flags.
+        use crate::kind::MediaKind;
+        let (f, _g) = fixture("noclobber");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let row = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        let hash = ensure_content_hash(&f.catalog, &row).unwrap();
+        f.catalog.set_rating(&hash, 5).unwrap();
+        f.catalog.set_hidden(&hash, true).unwrap();
+        f.catalog.set_kind(&hash, Some(MediaKind::Saved)).unwrap();
+
+        // Re-index twice, to catch both the "skipped, unchanged" fast path and
+        // anything that might rewrite the row.
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let after = &f.catalog.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(after.rating, 5, "rating survived re-indexing");
+        assert!(after.hidden, "hidden flag survived re-indexing");
+        assert_eq!(after.kind_override, Some(MediaKind::Saved));
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn replacing_a_file_with_different_bytes_does_not_inherit_its_metadata() {
+        // A direct consequence of keying user metadata on content hash: metadata
+        // follows the *bytes*, not the path. Overwrite a photo with a different
+        // image and the new content starts unrated, because as far as the
+        // catalog is concerned it is a different picture that happens to live at
+        // the same path.
+        //
+        // Pinned deliberately. It is the right behaviour for "this path now
+        // holds something else", and arguably the wrong one for "I cropped this
+        // photo and saved over it" — so it should not change by accident.
+        use crate::kind::MediaKind;
+        let (f, _g) = fixture("rebytes");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        let row = f.catalog.all_present(Visibility::All).unwrap()[0].clone();
+        let old_hash = ensure_content_hash(&f.catalog, &row).unwrap();
+        f.catalog.set_rating(&old_hash, 5).unwrap();
+        f.catalog.set_kind(&old_hash, Some(MediaKind::Saved)).unwrap();
+
+        // mtime has one-second resolution, so wait before rewriting.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        f.image("a.png", 48, 48, 9); // same path, different content
+
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+        let after = &f.catalog.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(after.rating, 0, "new content is unrated");
+        assert_eq!(after.kind_override, None);
+
+        // The old rating is not lost, just detached: it still applies to those
+        // bytes should they reappear.
+        assert_eq!(f.catalog.rating_of(&old_hash).unwrap(), 5);
+
+        cleanup(&f);
+    }
+
+    #[test]
+    fn a_stale_metadata_stamp_forces_a_re_read_of_an_unchanged_file() {
+        // The backfill mechanism. Without it, adding a new extracted field
+        // (GPS, most recently) would only ever apply to new and changed files,
+        // leaving an existing library permanently missing it.
+        let (f, _g) = fixture("metaversion");
+        f.image("a.png", 32, 32, 1);
+        index_library(&f.catalog, &f.cfg(), &Progress::default());
+
+        // Unchanged: skipped entirely.
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(out.unchanged, 1);
+        assert_eq!(out.updated, 0);
+
+        // Simulate a row written by an older build, without touching the file.
+        f.catalog.mark_meta_stale_for_tests();
+
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(
+            out.updated, 1,
+            "stale stamp must re-read the file even though it is unchanged"
+        );
+        assert_eq!(out.unchanged, 0);
+
+        // And the stamp is brought up to date, so it settles after one pass.
+        let out = index_library(&f.catalog, &f.cfg(), &Progress::default());
+        assert_eq!(out.unchanged, 1);
+        assert_eq!(out.updated, 0);
 
         cleanup(&f);
     }

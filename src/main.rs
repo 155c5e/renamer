@@ -7,10 +7,12 @@ mod dupes;
 mod engine;
 mod hashing;
 mod indexer;
+mod kind;
 mod metadata;
 mod paths;
 mod pcloud;
 mod quarantine;
+mod slideshow;
 mod template;
 mod thumbs;
 

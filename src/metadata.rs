@@ -24,6 +24,11 @@ pub struct FileMeta {
     pub iso: Option<String>,
     pub width: Option<String>,
     pub height: Option<String>,
+
+    /// Decimal degrees, south and west negative. Both are set together or not
+    /// at all — half a coordinate is useless.
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
 }
 
 impl FileMeta {
@@ -145,6 +150,78 @@ fn systime_to_local(t: std::time::SystemTime) -> DateTime<Local> {
     DateTime::<Local>::from(t)
 }
 
+/// Convert an EXIF GPS coordinate to signed decimal degrees.
+///
+/// EXIF stores position as three rationals — degrees, minutes, seconds — with the
+/// hemisphere in a separate reference tag, so south and west come back positive
+/// and have to be negated.
+fn gps_degrees(exif: &exif::Exif, coord: exif::Tag, reference: exif::Tag) -> Option<f64> {
+    use exif::{In, Value};
+
+    let field = exif.get_field(coord, In::PRIMARY)?;
+    let parts = match &field.value {
+        Value::Rational(v) => v,
+        _ => return None,
+    };
+    if parts.len() < 3 {
+        return None;
+    }
+    // Some cameras put the whole value in degrees and leave minutes/seconds
+    // zero; the arithmetic handles that without a special case.
+    let degrees = parts[0].to_f64() + parts[1].to_f64() / 60.0 + parts[2].to_f64() / 3600.0;
+
+    let hemisphere = exif
+        .get_field(reference, In::PRIMARY)
+        .map(|f| f.display_value().to_string().trim_matches('"').to_uppercase())
+        .unwrap_or_default();
+    if hemisphere.starts_with('S') || hemisphere.starts_with('W') {
+        Some(-degrees)
+    } else {
+        Some(degrees)
+    }
+}
+
+/// Format a coordinate pair the way a human reads one.
+pub fn format_coords(lat: f64, lon: f64) -> String {
+    format!(
+        "{:.5}°{}, {:.5}°{}",
+        lat.abs(),
+        if lat >= 0.0 { "N" } else { "S" },
+        lon.abs(),
+        if lon >= 0.0 { "E" } else { "W" },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coordinates_format_with_hemispheres() {
+        assert_eq!(format_coords(51.5074, -0.1278), "51.50740°N, 0.12780°W");
+        assert_eq!(format_coords(-33.8688, 151.2093), "33.86880°S, 151.20930°E");
+        assert_eq!(format_coords(0.0, 0.0), "0.00000°N, 0.00000°E");
+    }
+
+    #[test]
+    fn image_extensions_cover_raw_and_heic() {
+        // GPS lives in EXIF, which RAW and HEIC both carry, so they must stay in
+        // the "worth reading metadata from" list even though they cannot be
+        // decoded for thumbnails.
+        for ext in ["jpg", "JPEG", "heic", "cr2", "nef", "dng", "arw"] {
+            assert!(is_image_ext(ext), "{ext}");
+        }
+        assert!(!is_image_ext("txt"));
+        assert!(!is_image_ext(""));
+    }
+
+    #[test]
+    fn geotag_defaults_to_absent() {
+        let m = FileMeta::default();
+        assert!(m.lat.is_none() && m.lon.is_none());
+    }
+}
+
 fn read_exif(path: &Path, m: &mut FileMeta) {
     use exif::{In, Reader, Tag, Value};
 
@@ -173,6 +250,19 @@ fn read_exif(path: &Path, m: &mut FileMeta) {
     m.iso = str_field(Tag::PhotographicSensitivity);
     m.width = str_field(Tag::PixelXDimension);
     m.height = str_field(Tag::PixelYDimension);
+
+    // Geotag. Only accepted as a pair, since one axis alone cannot place a photo.
+    if let (Some(lat), Some(lon)) = (
+        gps_degrees(&exif, Tag::GPSLatitude, Tag::GPSLatitudeRef),
+        gps_degrees(&exif, Tag::GPSLongitude, Tag::GPSLongitudeRef),
+    ) {
+        // Reject implausible values rather than letting a corrupt tag put a
+        // photo in the middle of the ocean at (0, 0).
+        if lat.abs() <= 90.0 && lon.abs() <= 180.0 && !(lat == 0.0 && lon == 0.0) {
+            m.lat = Some(lat);
+            m.lon = Some(lon);
+        }
+    }
 
     // Prefer DateTimeOriginal (shutter time), fall back to DateTime.
     let raw = exif

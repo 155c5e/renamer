@@ -7,6 +7,8 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::catalog::{Catalog, CatalogStats, MediaRow, Visibility};
 use crate::colour;
+use crate::kind::{self, MediaKind};
+use crate::slideshow::{SlideOrder, Slideshow};
 use crate::dupes::{self, DupConfig, DupGroup, DupKind, DupReport};
 use crate::engine::{self, Plan, Progress, RowStatus, Settings, UndoEntry};
 use crate::indexer::{self, IndexConfig, IndexOutcome};
@@ -20,9 +22,14 @@ use crate::thumbs;
 enum Tab {
     Library,
     Images,
+    Slideshow,
     Duplicates,
     Rename,
 }
+
+/// Longest edge an image is scaled to before upload as a GPU texture. Well
+/// beyond any display, and far cheaper than uploading a 50-megapixel original.
+const SLIDE_MAX_EDGE: u32 = 2560;
 
 /// Whether the parent filter starts enabled.
 ///
@@ -38,6 +45,15 @@ enum SortBy {
     Date,
     Size,
     Colour,
+    Rating,
+}
+
+/// A pending edit to one row's user metadata, applied after the list has been
+/// drawn so the collection is not mutated mid-iteration.
+enum RowEdit {
+    Hidden(bool),
+    Rating(u8),
+    Kind(Option<MediaKind>),
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -117,6 +133,21 @@ pub struct RenamerApp {
     images: Vec<MediaRow>,
     image_filter: String,
     sort_by: SortBy,
+    /// Only show images rated at least this many stars. 0 shows everything.
+    min_rating: u8,
+    /// Kinds to show. Empty means no filter.
+    kind_filter: Vec<MediaKind>,
+
+    // --- slideshow ---
+    show: Slideshow,
+    slide_order: SlideOrder,
+    /// Texture currently on screen, tagged with the image index it belongs to.
+    slide_texture: Option<(usize, egui::TextureHandle)>,
+    /// In-flight decode. The previous image stays up until this lands, so
+    /// advancing never flashes an empty frame.
+    slide_rx: Option<Receiver<(usize, Option<egui::ColorImage>)>>,
+    slide_last_advance: std::time::Instant,
+    slide_fullscreen: bool,
 
     // --- duplicates ---
     dup_cfg: DupConfig,
@@ -172,6 +203,14 @@ impl Default for RenamerApp {
             images: Vec::new(),
             image_filter: String::new(),
             sort_by: SortBy::Path,
+            min_rating: 0,
+            kind_filter: Vec::new(),
+            show: Slideshow::default(),
+            slide_order: SlideOrder::AsListed,
+            slide_texture: None,
+            slide_rx: None,
+            slide_last_advance: std::time::Instant::now(),
+            slide_fullscreen: false,
             dup_cfg: DupConfig::default(),
             report: None,
             selections: Vec::new(),
@@ -305,11 +344,16 @@ impl RenamerApp {
         });
     }
 
-    /// Hide or unhide one image.
+    /// Apply one user-metadata edit to a row.
     ///
     /// Runs inline rather than on a worker: it is a single row write, plus at
     /// most one content hash for a file that has never needed one.
-    fn set_hidden(&mut self, row_index: usize, hidden: bool) {
+    ///
+    /// All user metadata is keyed on content hash, so the edit lands on every
+    /// byte-identical copy. The in-memory list is updated to match rather than
+    /// waiting for a reload, otherwise the screen would disagree with the
+    /// database until the next refresh.
+    fn edit_row(&mut self, row_index: usize, edit: RowEdit) {
         let Some(row) = self.images.get(row_index).cloned() else {
             return;
         };
@@ -317,33 +361,49 @@ impl RenamerApp {
             self.message = "Could not open the catalog.".to_string();
             return;
         };
-        match indexer::ensure_content_hash(&cat, &row) {
-            Ok(hash) => match cat.set_hidden(&hash, hidden) {
-                Ok(()) => {
-                    self.images[row_index].hidden = hidden;
-                    self.message = format!(
-                        "{} {}",
-                        if hidden { "Hidden:" } else { "Unhidden:" },
-                        row.file_name
-                    );
-                    // Byte-identical copies share user metadata, so reflect that
-                    // in the list rather than waiting for a reload.
-                    for other in self.images.iter_mut() {
-                        if other.content_hash.is_some()
-                            && other.content_hash == Some(hash.clone())
-                        {
-                            other.hidden = hidden;
-                        }
-                    }
-                    self.refresh_stats();
-                }
-                Err(e) => self.message = format!("Could not update: {e}"),
-            },
-            Err(e) => self.message = format!("Could not hash for tagging: {e}"),
+        let hash = match indexer::ensure_content_hash(&cat, &row) {
+            Ok(h) => h,
+            Err(e) => {
+                self.message = format!("Could not hash for tagging: {e}");
+                return;
+            }
+        };
+
+        let written = match edit {
+            RowEdit::Hidden(v) => cat.set_hidden(&hash, v),
+            RowEdit::Rating(v) => cat.set_rating(&hash, v),
+            RowEdit::Kind(v) => cat.set_kind(&hash, v),
+        };
+        if let Err(e) = written {
+            self.message = format!("Could not update: {e}");
+            return;
         }
+
+        // Keep the freshly computed hash on the row, so a second edit to the
+        // same file doesn't re-read it from disk.
+        self.images[row_index].content_hash = Some(hash.clone());
+        for other in self.images.iter_mut() {
+            if other.content_hash.as_deref() == Some(hash.as_str()) {
+                match edit {
+                    RowEdit::Hidden(v) => other.hidden = v,
+                    RowEdit::Rating(v) => other.rating = v,
+                    RowEdit::Kind(v) => other.kind_override = v,
+                }
+            }
+        }
+
+        self.message = match edit {
+            RowEdit::Hidden(true) => format!("Hidden: {}", row.file_name),
+            RowEdit::Hidden(false) => format!("Unhidden: {}", row.file_name),
+            RowEdit::Rating(0) => format!("Cleared rating: {}", row.file_name),
+            RowEdit::Rating(v) => format!("{v}★ {}", row.file_name),
+            RowEdit::Kind(Some(k)) => format!("Marked as {}: {}", k.label(), row.file_name),
+            RowEdit::Kind(None) => format!("Kind back to automatic: {}", row.file_name),
+        };
+        self.refresh_stats();
     }
 
-    /// Rows to show in the image list, filtered by text and ordered.
+    /// Rows to show in the image list, filtered and ordered.
     fn visible_images(&self) -> Vec<usize> {
         let needle = self.image_filter.trim().to_lowercase();
         let mut idx: Vec<usize> = self
@@ -352,6 +412,10 @@ impl RenamerApp {
             .enumerate()
             .filter(|(_, r)| {
                 needle.is_empty() || r.path.to_string_lossy().to_lowercase().contains(&needle)
+            })
+            .filter(|(_, r)| r.rating >= self.min_rating)
+            .filter(|(_, r)| {
+                self.kind_filter.is_empty() || self.kind_filter.contains(&kind::effective(r))
             })
             .map(|(i, _)| i)
             .collect();
@@ -373,6 +437,13 @@ impl RenamerApp {
             SortBy::Colour => idx.sort_by(|&a, &b| {
                 colour::hue_sort_key(self.images[a].dom_color)
                     .cmp(&colour::hue_sort_key(self.images[b].dom_color))
+                    .then_with(|| self.images[a].path.cmp(&self.images[b].path))
+            }),
+            // Best first — the point of rating is to find the keepers.
+            SortBy::Rating => idx.sort_by(|&a, &b| {
+                self.images[b]
+                    .rating
+                    .cmp(&self.images[a].rating)
                     .then_with(|| self.images[a].path.cmp(&self.images[b].path))
             }),
         }
@@ -822,6 +893,24 @@ fn undo_summary(reverted: usize, errors: &[String]) -> String {
     }
 }
 
+/// Decode an image for on-screen display, downscaled to something a GPU texture
+/// is happy with. Returns `None` for anything undecodable.
+fn decode_for_display(path: &std::path::Path) -> Option<egui::ColorImage> {
+    let img = image::open(path).ok()?;
+    let img = if img.width().max(img.height()) > SLIDE_MAX_EDGE {
+        img.resize(
+            SLIDE_MAX_EDGE,
+            SLIDE_MAX_EDGE,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    let size = [rgba.width() as usize, rgba.height() as usize];
+    Some(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()))
+}
+
 /// Update catalog paths after the app moved files, so rows (and everything
 /// expensive attached to them) follow their files instead of being rebuilt.
 ///
@@ -864,6 +953,7 @@ impl eframe::App for RenamerApp {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Library, "Library");
                 ui.selectable_value(&mut self.tab, Tab::Images, "Images");
+                ui.selectable_value(&mut self.tab, Tab::Slideshow, "Slideshow");
                 ui.selectable_value(&mut self.tab, Tab::Duplicates, "Duplicates");
                 ui.selectable_value(&mut self.tab, Tab::Rename, "Rename");
 
@@ -936,6 +1026,7 @@ impl eframe::App for RenamerApp {
         match self.tab {
             Tab::Library => self.library_tab(ctx, busy),
             Tab::Images => self.images_tab(ctx, busy),
+            Tab::Slideshow => self.slideshow_tab(ctx, busy),
             Tab::Duplicates => self.duplicates_tab(ctx, busy),
             Tab::Rename => self.rename_tab(ctx, busy),
         }
@@ -1104,17 +1195,38 @@ impl RenamerApp {
                             "Arranges by hue into a rainbow. Greyscale images collect at \
                              the end, since they have no meaningful hue.",
                         );
+                    ui.selectable_value(&mut self.sort_by, SortBy::Rating, "Rating");
                 });
                 ui.horizontal(|ui| {
                     ui.label("Filter:");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.image_filter)
-                            .desired_width(280.0)
+                            .desired_width(240.0)
                             .hint_text("path contains…"),
                     );
+                    ui.add(
+                        egui::Slider::new(&mut self.min_rating, 0..=5).text("min ★"),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Kind:");
+                    for k in MediaKind::ALL {
+                        let mut on = self.kind_filter.contains(&k);
+                        if ui.checkbox(&mut on, k.label()).changed() {
+                            if on {
+                                self.kind_filter.push(k);
+                            } else {
+                                self.kind_filter.retain(|x| *x != k);
+                            }
+                        }
+                    }
+                    if self.kind_filter.is_empty() {
+                        ui.small("(all)");
+                    }
                     if self.parent_filter && self.hidden_count > 0 {
+                        ui.separator();
                         ui.small(format!(
-                            "{} image(s) hidden — turn off the parent filter to manage them.",
+                            "{} hidden — turn off the parent filter to manage them.",
                             self.hidden_count
                         ));
                     }
@@ -1132,33 +1244,41 @@ impl RenamerApp {
             }
 
             let order = self.visible_images();
-            let mut toggle: Option<(usize, bool)> = None;
+            ui.small(format!("{} of {} shown", order.len(), self.images.len()));
+            ui.separator();
+
+            let mut pending: Option<(usize, RowEdit)> = None;
 
             egui::ScrollArea::vertical().show(ui, |ui| {
                 for &i in &order {
                     let row = &self.images[i];
                     ui.horizontal(|ui| {
                         // Colour swatch, so the colour sort is legible.
-                        let (rect, _) = ui.allocate_exact_size(
-                            egui::vec2(18.0, 18.0),
-                            egui::Sense::hover(),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
                         if let Some(c) = row.dom_color {
                             let (r, g, b) = colour::unpack(c);
-                            ui.painter().rect_filled(
-                                rect,
-                                2.0,
-                                egui::Color32::from_rgb(r, g, b),
-                            );
+                            ui.painter()
+                                .rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+                        }
+
+                        if let Some(stars) = star_picker(ui, i, row.rating) {
+                            pending = Some((i, RowEdit::Rating(stars)));
                         }
 
                         let mut hidden = row.hidden;
                         if ui
                             .checkbox(&mut hidden, "hide")
-                            .on_hover_text("Hide this image everywhere while the parent filter is on")
+                            .on_hover_text(
+                                "Hide this image everywhere while the parent filter is on",
+                            )
                             .changed()
                         {
-                            toggle = Some((i, hidden));
+                            pending = Some((i, RowEdit::Hidden(hidden)));
+                        }
+
+                        if let Some(k) = kind_picker(ui, i, row) {
+                            pending = Some((i, RowEdit::Kind(k)));
                         }
 
                         ui.monospace(format!("{:>9}", human_bytes(row.size)));
@@ -1174,8 +1294,234 @@ impl RenamerApp {
             });
 
             // Applied after the loop so the list is not mutated mid-iteration.
-            if let Some((i, hidden)) = toggle {
-                self.set_hidden(i, hidden);
+            if let Some((i, edit)) = pending {
+                self.edit_row(i, edit);
+            }
+        });
+    }
+
+    // ---- Slideshow ----
+
+    /// Rebuild the sequence from whatever the Images tab is currently showing.
+    ///
+    /// Deriving it from `visible_images` means every filter already in force —
+    /// the parent filter, minimum stars, kind — carries over automatically.
+    /// There is no second filtering path that could disagree.
+    fn rebuild_slideshow(&mut self) {
+        let visible = self.visible_images();
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(1);
+        let order = crate::slideshow::build_order(&self.images, &visible, self.slide_order, seed);
+        self.show.resequence(order);
+    }
+
+    /// Kick off a background decode of the current image, unless its texture is
+    /// already up.
+    fn request_slide(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.show.current() else {
+            self.slide_texture = None;
+            return;
+        };
+        if self.slide_texture.as_ref().map(|(i, _)| *i) == Some(idx) {
+            return;
+        }
+        let Some(path) = self.images.get(idx).map(|r| r.path.clone()) else {
+            return;
+        };
+
+        let (tx, rx) = channel();
+        self.slide_rx = Some(rx);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((idx, decode_for_display(&path)));
+            ctx.request_repaint();
+        });
+    }
+
+    /// Upload a finished decode, if one has arrived.
+    fn poll_slide(&mut self, ctx: &egui::Context) {
+        let Some(rx) = self.slide_rx.as_ref() else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((idx, Some(image))) => {
+                self.slide_rx = None;
+                let handle =
+                    ctx.load_texture(format!("slide{idx}"), image, egui::TextureOptions::LINEAR);
+                // Replacing the handle drops the old texture, so memory does not
+                // grow across a long slideshow.
+                self.slide_texture = Some((idx, handle));
+            }
+            Ok((idx, None)) => {
+                self.slide_rx = None;
+                let name = self
+                    .images
+                    .get(idx)
+                    .map(|r| r.file_name.clone())
+                    .unwrap_or_default();
+                self.message = format!("Could not display {name}");
+                // Skip past it rather than stalling on an undecodable file.
+                if self.show.playing {
+                    self.show.next();
+                }
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.slide_rx = None,
+        }
+    }
+
+    fn slideshow_tab(&mut self, ctx: &egui::Context, busy: bool) {
+        // Sequence follows the Images tab, so a fresh load or filter change is
+        // picked up without a separate "refresh" button.
+        if self.show.len() != self.visible_images().len() {
+            self.rebuild_slideshow();
+        }
+
+        // --- keyboard: collected first, applied after, to avoid borrowing ctx
+        // while mutating self ---
+        let (toggle, go_next, go_prev, escape) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::ArrowRight) || i.key_pressed(egui::Key::N),
+                i.key_pressed(egui::Key::ArrowLeft) || i.key_pressed(egui::Key::P),
+                i.key_pressed(egui::Key::Escape),
+            )
+        });
+        if toggle {
+            self.show.playing = !self.show.playing;
+            self.slide_last_advance = std::time::Instant::now();
+        }
+        if go_next {
+            self.show.next();
+            self.slide_last_advance = std::time::Instant::now();
+        }
+        if go_prev {
+            self.show.prev();
+            self.slide_last_advance = std::time::Instant::now();
+        }
+        if escape && self.slide_fullscreen {
+            self.slide_fullscreen = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+
+        // --- advance on the timer ---
+        if self.show.playing && !self.show.is_empty() {
+            if self.slide_last_advance.elapsed().as_secs_f32() >= self.show.interval_secs {
+                self.show.next();
+                self.slide_last_advance = std::time::Instant::now();
+            }
+            // Keep the frame loop alive while playing, without spinning.
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+
+        self.request_slide(ctx);
+        self.poll_slide(ctx);
+
+        egui::TopBottomPanel::top("slide_controls").show(ctx, |ui| {
+            ui.add_enabled_ui(!busy, |ui| {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    let label = if self.show.playing { "⏸ Pause" } else { "▶ Play" };
+                    if ui.button(label).clicked() {
+                        self.show.playing = !self.show.playing;
+                        self.slide_last_advance = std::time::Instant::now();
+                    }
+                    if ui.button("⏮").on_hover_text("Previous (← or P)").clicked() {
+                        self.show.prev();
+                        self.slide_last_advance = std::time::Instant::now();
+                    }
+                    if ui.button("⏭").on_hover_text("Next (→ or N)").clicked() {
+                        self.show.next();
+                        self.slide_last_advance = std::time::Instant::now();
+                    }
+                    ui.add(
+                        egui::Slider::new(
+                            &mut self.show.interval_secs,
+                            crate::slideshow::MIN_INTERVAL..=crate::slideshow::MAX_INTERVAL,
+                        )
+                        .text("sec"),
+                    );
+                    if ui
+                        .checkbox(&mut self.slide_fullscreen, "Fullscreen")
+                        .changed()
+                    {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(
+                            self.slide_fullscreen,
+                        ));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Order:");
+                    for o in SlideOrder::ALL {
+                        if ui
+                            .selectable_label(self.slide_order == o, o.label())
+                            .clicked()
+                        {
+                            self.slide_order = o;
+                            self.rebuild_slideshow();
+                        }
+                    }
+                    ui.separator();
+                    ui.small(
+                        "Shows exactly what the Images tab shows, filters and all. \
+                         Space plays or pauses.",
+                    );
+                });
+                ui.add_space(2.0);
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.show.is_empty() {
+                ui.centered_and_justified(|ui| {
+                    ui.label(
+                        "Nothing to show. Load images on the Images tab, and check your \
+                         filters aren't excluding everything.",
+                    );
+                });
+                return;
+            }
+
+            let caption = self
+                .show
+                .current()
+                .and_then(|i| self.images.get(i))
+                .map(|r| {
+                    format!(
+                        "{}  ·  {}{}",
+                        r.file_name,
+                        "★".repeat(r.rating as usize),
+                        "☆".repeat(5 - r.rating.min(5) as usize)
+                    )
+                })
+                .unwrap_or_default();
+
+            ui.horizontal(|ui| {
+                ui.small(format!("{} / {}", self.show.pos() + 1, self.show.len()));
+                ui.separator();
+                ui.small(caption);
+            });
+
+            let available = ui.available_size();
+            match &self.slide_texture {
+                Some((_, tex)) => {
+                    // Fit inside the panel without ever upscaling past 1:1.
+                    let size = tex.size_vec2();
+                    let scale = (available.x / size.x)
+                        .min(available.y / size.y)
+                        .min(1.0)
+                        .max(0.01);
+                    ui.centered_and_justified(|ui| {
+                        ui.image((tex.id(), size * scale));
+                    });
+                }
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.spinner();
+                    });
+                }
             }
         });
     }
@@ -1495,6 +1841,73 @@ impl RenamerApp {
     }
 }
 
+/// Five clickable stars. Returns the new rating when it changes.
+///
+/// Clicking the star that is already the rating clears it, which is the
+/// convention every photo tool uses and saves needing a separate "unrate"
+/// control.
+fn star_picker(ui: &mut egui::Ui, row_index: usize, rating: u8) -> Option<u8> {
+    let mut changed = None;
+    // Scoped id per row, so identical star buttons on different rows do not
+    // collide in egui's id space.
+    ui.push_id(("stars", row_index), |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            for star in 1..=5u8 {
+                let filled = star <= rating;
+                let text = egui::RichText::new(if filled { "★" } else { "☆" }).color(if filled {
+                    egui::Color32::from_rgb(240, 200, 90)
+                } else {
+                    egui::Color32::from_gray(110)
+                });
+                if ui
+                    .add(egui::Button::new(text).frame(false).small())
+                    .on_hover_text(format!("{star}★"))
+                    .clicked()
+                {
+                    changed = Some(if rating == star { 0 } else { star });
+                }
+            }
+        });
+    });
+    changed
+}
+
+/// Kind label with an override menu. Returns `Some(new_override)` on change,
+/// where the inner `None` means "go back to the automatic guess".
+fn kind_picker(ui: &mut egui::Ui, row_index: usize, row: &MediaRow) -> Option<Option<MediaKind>> {
+    let effective = kind::effective(row);
+    let overridden = row.kind_override.is_some();
+    let label = if overridden {
+        format!("{}*", effective.label())
+    } else {
+        effective.label().to_string()
+    };
+
+    let mut changed = None;
+    egui::ComboBox::from_id_salt(("kind", row_index))
+        .selected_text(label)
+        .width(96.0)
+        .show_ui(ui, |ui| {
+            if ui
+                .selectable_label(!overridden, "auto")
+                .on_hover_text("Use the guess from the file's own metadata")
+                .clicked()
+            {
+                changed = Some(None);
+            }
+            for k in MediaKind::ALL {
+                if ui
+                    .selectable_label(row.kind_override == Some(k), k.label())
+                    .clicked()
+                {
+                    changed = Some(Some(k));
+                }
+            }
+        });
+    changed
+}
+
 /// One duplicate group: header line plus a row per member with a keeper choice.
 fn group_ui(ui: &mut egui::Ui, gi: usize, group: &DupGroup, sel: &mut GroupSel) {
     let color = kind_color(group.kind);
@@ -1744,6 +2157,165 @@ mod tests {
         // Size sorts largest first — that is what you want when reclaiming space.
         app.sort_by = SortBy::Size;
         assert_eq!(names(&app), vec!["c.jpg", "b.jpg", "a.jpg"]);
+    }
+
+    #[test]
+    fn slideshow_inherits_every_images_tab_filter() {
+        // The sequence is derived from `visible_images`, so a hidden image or
+        // one below the star threshold can never appear in the slideshow. This
+        // is the property that keeps the parent filter honest here too.
+        let mut app = RenamerApp::default();
+        app.images = vec![
+            MediaRow {
+                rating: 5,
+                ..img("/l/keep.jpg", 1, None, None)
+            },
+            MediaRow {
+                rating: 1,
+                ..img("/l/meh.jpg", 1, None, None)
+            },
+            MediaRow {
+                rating: 5,
+                hidden: true,
+                ..img("/l/private.jpg", 1, None, None)
+            },
+        ];
+        // `visible_images` is the single gate; hidden rows are excluded upstream
+        // by the catalog query, so model that by filtering on rating here.
+        app.min_rating = 5;
+        app.rebuild_slideshow();
+
+        let shown: Vec<String> = (0..app.show.len())
+            .map(|_| {
+                let name = app
+                    .show
+                    .current()
+                    .map(|i| app.images[i].file_name.clone())
+                    .unwrap_or_default();
+                app.show.next();
+                name
+            })
+            .collect();
+        assert!(!shown.iter().any(|n| n == "meh.jpg"), "below threshold");
+        assert!(shown.contains(&"keep.jpg".to_string()));
+    }
+
+    #[test]
+    fn slideshow_rebuilds_when_the_filter_changes() {
+        let mut app = RenamerApp::default();
+        app.images = vec![
+            MediaRow {
+                rating: 5,
+                ..img("/l/a.jpg", 1, None, None)
+            },
+            MediaRow {
+                rating: 0,
+                ..img("/l/b.jpg", 1, None, None)
+            },
+        ];
+        app.rebuild_slideshow();
+        assert_eq!(app.show.len(), 2);
+
+        app.min_rating = 5;
+        app.rebuild_slideshow();
+        assert_eq!(app.show.len(), 1);
+        assert_eq!(
+            app.show.current().map(|i| app.images[i].file_name.clone()),
+            Some("a.jpg".to_string())
+        );
+    }
+
+    #[test]
+    fn rating_filter_and_sort() {
+        let mut app = RenamerApp::default();
+        let rated = |p: &str, stars: u8| MediaRow {
+            rating: stars,
+            ..img(p, 1, None, None)
+        };
+        app.images = vec![
+            rated("/l/one.jpg", 1),
+            rated("/l/five.jpg", 5),
+            rated("/l/none.jpg", 0),
+            rated("/l/three.jpg", 3),
+        ];
+
+        // Best first: the point of rating is finding the keepers.
+        app.sort_by = SortBy::Rating;
+        assert_eq!(
+            names(&app),
+            vec!["five.jpg", "three.jpg", "one.jpg", "none.jpg"]
+        );
+
+        app.min_rating = 3;
+        assert_eq!(names(&app), vec!["five.jpg", "three.jpg"]);
+
+        app.min_rating = 5;
+        assert_eq!(names(&app), vec!["five.jpg"]);
+
+        app.min_rating = 0;
+        assert_eq!(names(&app).len(), 4);
+    }
+
+    #[test]
+    fn kind_filter_selects_by_effective_kind() {
+        let mut app = RenamerApp::default();
+        let photo = MediaRow {
+            camera_model: Some("R5".into()),
+            ..img("/l/IMG_1.jpg", 1, None, None)
+        };
+        let shot = img("/l/Screenshot 2024.png", 1, None, None);
+        let saved = img("/l/inspo.jpg", 1, None, None);
+        app.images = vec![photo, shot, saved];
+
+        assert_eq!(names(&app).len(), 3, "no filter shows everything");
+
+        app.kind_filter = vec![MediaKind::Photo];
+        assert_eq!(names(&app), vec!["IMG_1.jpg"]);
+
+        app.kind_filter = vec![MediaKind::Screenshot, MediaKind::Saved];
+        assert_eq!(names(&app), vec!["Screenshot 2024.png", "inspo.jpg"]);
+    }
+
+    #[test]
+    fn kind_filter_respects_a_user_override() {
+        let mut app = RenamerApp::default();
+        // Looks like a photo, but the user has said it is a saved image.
+        app.images = vec![MediaRow {
+            camera_model: Some("R5".into()),
+            kind_override: Some(MediaKind::Saved),
+            ..img("/l/IMG_1.jpg", 1, None, None)
+        }];
+
+        app.kind_filter = vec![MediaKind::Photo];
+        assert!(names(&app).is_empty(), "override wins over the guess");
+
+        app.kind_filter = vec![MediaKind::Saved];
+        assert_eq!(names(&app), vec!["IMG_1.jpg"]);
+    }
+
+    #[test]
+    fn filters_combine() {
+        let mut app = RenamerApp::default();
+        app.images = vec![
+            MediaRow {
+                rating: 5,
+                camera_model: Some("R5".into()),
+                ..img("/l/holiday/IMG_1.jpg", 1, None, None)
+            },
+            MediaRow {
+                rating: 1,
+                camera_model: Some("R5".into()),
+                ..img("/l/holiday/IMG_2.jpg", 1, None, None)
+            },
+            MediaRow {
+                rating: 5,
+                ..img("/l/work/inspo.jpg", 1, None, None)
+            },
+        ];
+        app.min_rating = 5;
+        app.kind_filter = vec![MediaKind::Photo];
+        app.image_filter = "holiday".into();
+        assert_eq!(names(&app), vec!["IMG_1.jpg"]);
     }
 
     #[test]

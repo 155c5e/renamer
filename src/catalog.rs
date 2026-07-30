@@ -25,13 +25,29 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 /// Current schema version. Bump when altering the schema and add a migration
 /// step in [`Catalog::migrate`].
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
+
+/// Version of the metadata the walk pass extracts.
+///
+/// Bump this whenever the indexer starts reading a *new* field from a file's own
+/// metadata. Rows stamped with an older version are re-examined on the next
+/// index even when their size and mtime are unchanged, which is the only way a
+/// newly-added field ever reaches files that were catalogued before it existed.
+///
+/// Without it, adding GPS extraction would have silently applied to new and
+/// changed files only, leaving an already-indexed library permanently without
+/// coordinates and no obvious reason why.
+///
+/// * 1 — original: name, size, dates, camera, dimensions
+/// * 2 — added GPS latitude/longitude
+pub const META_VERSION: i64 = 2;
 
 /// Columns selected by the `present_*` queries, in the order [`read_media_row`]
 /// expects. Kept in one place so the call sites cannot drift apart.
 const MEDIA_COLUMNS: &str = "m.id, m.path, m.file_name, m.ext, m.size, m.mtime, m.date_taken, \
      m.camera_make, m.camera_model, m.lens, m.iso, m.width, m.height, m.content_hash, \
-     m.phash, m.missing, m.dom_color, COALESCE(u.hidden, 0)";
+     m.phash, m.missing, m.dom_color, COALESCE(u.hidden, 0), COALESCE(u.rating, 0), u.kind, \
+     m.lat, m.lon";
 
 /// Whether a query should include images the user has hidden.
 ///
@@ -92,6 +108,21 @@ pub struct MediaRow {
     /// Hidden by the user (the parent filter). Read-only here: it lives in
     /// `user_meta`, keyed on content hash, and is joined in.
     pub hidden: bool,
+    /// 0–5 stars; 0 means unrated. Joined from `user_meta`.
+    pub rating: u8,
+    /// User's override of the guessed media kind, if any. `None` means "trust
+    /// the guess" — see [`crate::kind::effective`].
+    pub kind_override: Option<crate::kind::MediaKind>,
+    /// Geotag in decimal degrees, south and west negative. Set as a pair.
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
+}
+
+impl MediaRow {
+    /// Coordinates, when the photo has a complete geotag.
+    pub fn coords(&self) -> Option<(f64, f64)> {
+        self.lat.zip(self.lon)
+    }
 }
 
 /// The minimum needed to decide whether a file must be re-examined.
@@ -102,6 +133,9 @@ pub struct Stamp {
     pub mtime: i64,
     pub has_content_hash: bool,
     pub has_phash: bool,
+    /// Which generation of metadata extraction produced this row. A row behind
+    /// [`META_VERSION`] is re-examined even if the file is unchanged.
+    pub meta_version: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -142,6 +176,15 @@ impl Catalog {
     #[cfg(test)]
     pub fn open_in_memory() -> rusqlite::Result<Catalog> {
         Catalog::init(Connection::open_in_memory()?)
+    }
+
+    /// Pretend every row was written by an older build, so the indexer's
+    /// backfill path can be exercised without hand-rolling a stale database.
+    #[cfg(test)]
+    pub fn mark_meta_stale_for_tests(&self) {
+        self.conn
+            .execute("UPDATE media SET meta_version = 0", [])
+            .unwrap();
     }
 
     fn init(conn: Connection) -> rusqlite::Result<Catalog> {
@@ -214,6 +257,8 @@ impl Catalog {
             CREATE TABLE IF NOT EXISTS user_meta (
                 content_hash TEXT PRIMARY KEY,
                 hidden       INTEGER NOT NULL DEFAULT 0,
+                rating       INTEGER NOT NULL DEFAULT 0,
+                kind         TEXT,
                 updated_at   INTEGER NOT NULL
             );
             "#,
@@ -223,6 +268,22 @@ impl Catalog {
         // so an existing catalog keeps its hashes and thumbnails instead of
         // forcing a full re-index.
         self.add_column_if_missing("media", "dom_color", "INTEGER")?;
+
+        // v2 -> v3: star rating and media-kind override. Both are user-assigned,
+        // so they join `hidden` in `user_meta` keyed on content hash.
+        self.add_column_if_missing("user_meta", "rating", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_column_if_missing("user_meta", "kind", "TEXT")?;
+
+        // v3 -> v4: geotag, plus the metadata-generation stamp that lets a
+        // newly-extracted field reach already-indexed files. Existing rows
+        // default to version 0, so they are all below META_VERSION and get
+        // re-examined once.
+        self.add_column_if_missing("media", "lat", "REAL")?;
+        self.add_column_if_missing("media", "lon", "REAL")?;
+        self.add_column_if_missing("media", "meta_version", "INTEGER NOT NULL DEFAULT 0")?;
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS media_geo_idx ON media(lat, lon);",
+        )?;
 
         self.conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('version', ?1)
@@ -262,7 +323,8 @@ impl Catalog {
     /// skip unchanged files without issuing a query per file.
     pub fn stamps_under(&self, root: &Path) -> rusqlite::Result<HashMap<PathBuf, Stamp>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, path, size, mtime, content_hash IS NOT NULL, phash IS NOT NULL
+            "SELECT id, path, size, mtime, content_hash IS NOT NULL, phash IS NOT NULL,
+                    meta_version
              FROM media WHERE path LIKE ?1 ESCAPE '\\'",
         )?;
         let rows = stmt.query_map(params![like_prefix(root)], |r| {
@@ -274,6 +336,7 @@ impl Catalog {
                     mtime: r.get(3)?,
                     has_content_hash: r.get(4)?,
                     has_phash: r.get(5)?,
+                    meta_version: r.get(6)?,
                 },
             ))
         })?;
@@ -294,8 +357,9 @@ impl Catalog {
         self.conn.execute(
             "INSERT INTO media (path, file_name, ext, size, mtime, date_taken,
                                 camera_make, camera_model, lens, iso, width, height,
-                                content_hash, phash, dom_color, missing)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,0)
+                                content_hash, phash, dom_color, lat, lon,
+                                meta_version, missing)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,0)
              ON CONFLICT(path) DO UPDATE SET
                 file_name = excluded.file_name,
                 ext = excluded.ext,
@@ -317,6 +381,11 @@ impl Catalog {
                 dom_color = CASE
                     WHEN media.size = excluded.size AND media.mtime = excluded.mtime
                     THEN media.dom_color ELSE excluded.dom_color END,
+                -- Geotag comes from the same EXIF read as the rest of this
+                -- statement's values, so it is always current.
+                lat = excluded.lat,
+                lon = excluded.lon,
+                meta_version = excluded.meta_version,
                 missing = 0",
             params![
                 path_str(&row.path),
@@ -334,6 +403,9 @@ impl Catalog {
                 row.content_hash,
                 row.phash.map(|h| h as i64),
                 row.dom_color.map(|c| c as i64),
+                row.lat,
+                row.lon,
+                META_VERSION,
             ],
         )?;
         self.conn.query_row(
@@ -460,18 +532,61 @@ impl Catalog {
 
     // ---- user-assigned metadata ----
 
-    /// Hide or unhide the image with this content hash.
-    pub fn set_hidden(&self, content_hash: &str, hidden: bool) -> rusqlite::Result<()> {
+    /// Set one user-assigned field, leaving the others alone.
+    ///
+    /// `column` is only ever passed an internal constant, never anything from
+    /// the user, so interpolating it into the statement is safe. The values
+    /// themselves stay bound parameters.
+    fn set_user_meta<T: rusqlite::ToSql>(
+        &self,
+        content_hash: &str,
+        column: &str,
+        value: T,
+    ) -> rusqlite::Result<()> {
         self.conn.execute(
-            "INSERT INTO user_meta (content_hash, hidden, updated_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(content_hash) DO UPDATE SET hidden = ?2, updated_at = ?3",
-            params![
-                content_hash,
-                hidden as i64,
-                chrono::Utc::now().timestamp()
-            ],
+            &format!(
+                "INSERT INTO user_meta (content_hash, {column}, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(content_hash) DO UPDATE SET {column} = ?2, updated_at = ?3"
+            ),
+            params![content_hash, value, chrono::Utc::now().timestamp()],
         )?;
         Ok(())
+    }
+
+    /// Hide or unhide the image with this content hash.
+    pub fn set_hidden(&self, content_hash: &str, hidden: bool) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "hidden", hidden as i64)
+    }
+
+    /// Set a 0–5 star rating; 0 clears it. Values outside the range are clamped
+    /// rather than rejected, so a caller bug cannot poison the database.
+    pub fn set_rating(&self, content_hash: &str, rating: u8) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "rating", rating.min(5) as i64)
+    }
+
+    /// Override the guessed media kind, or pass `None` to go back to the guess.
+    pub fn set_kind(
+        &self,
+        content_hash: &str,
+        kind: Option<crate::kind::MediaKind>,
+    ) -> rusqlite::Result<()> {
+        self.set_user_meta(content_hash, "kind", kind.map(|k| k.as_str()))
+    }
+
+    /// Rating stored against this content hash, regardless of whether any file
+    /// currently has those bytes.
+    #[allow(dead_code)] // asserted by tests; views read the joined column
+    pub fn rating_of(&self, content_hash: &str) -> rusqlite::Result<u8> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT rating FROM user_meta WHERE content_hash = ?1",
+                params![content_hash],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            .clamp(0, 5) as u8)
     }
 
     /// Whether this content hash is hidden.
@@ -722,6 +837,13 @@ fn read_media_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MediaRow> {
         missing: r.get::<_, i64>(15)? != 0,
         dom_color: r.get::<_, Option<i64>>(16)?.map(|v| v as u32),
         hidden: r.get::<_, i64>(17)? != 0,
+        rating: r.get::<_, i64>(18)?.clamp(0, 5) as u8,
+        kind_override: r
+            .get::<_, Option<String>>(19)?
+            .as_deref()
+            .and_then(crate::kind::MediaKind::parse),
+        lat: r.get(20)?,
+        lon: r.get(21)?,
     })
 }
 
@@ -1266,6 +1388,232 @@ mod tests {
         drop(cat);
         let cat = Catalog::open(&db).unwrap();
         assert_eq!(cat.all_present(Visibility::All).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rating_roundtrips_and_clamps() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 0);
+
+        for stars in 0..=5u8 {
+            cat.set_rating("h", stars).unwrap();
+            assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, stars);
+        }
+        // A caller bug must not poison the database with an impossible rating.
+        cat.set_rating("h", 99).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 5);
+    }
+
+    #[test]
+    fn kind_override_roundtrips_and_clears() {
+        use crate::kind::MediaKind;
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].kind_override, None);
+
+        for k in MediaKind::ALL {
+            cat.set_kind("h", Some(k)).unwrap();
+            assert_eq!(
+                cat.all_present(Visibility::All).unwrap()[0].kind_override,
+                Some(k)
+            );
+        }
+        cat.set_kind("h", None).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].kind_override, None);
+    }
+
+    #[test]
+    fn user_meta_fields_are_independent() {
+        // Each setter writes one column; the others must survive untouched.
+        use crate::kind::MediaKind;
+        let cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.set_content_hash(id, "h").unwrap();
+
+        cat.set_rating("h", 4).unwrap();
+        cat.set_hidden("h", true).unwrap();
+        cat.set_kind("h", Some(MediaKind::Saved)).unwrap();
+
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.rating, 4);
+        assert!(got.hidden);
+        assert_eq!(got.kind_override, Some(MediaKind::Saved));
+
+        // Changing one still leaves the rest alone.
+        cat.set_hidden("h", false).unwrap();
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.rating, 4);
+        assert!(!got.hidden);
+        assert_eq!(got.kind_override, Some(MediaKind::Saved));
+    }
+
+    #[test]
+    fn ratings_and_kinds_survive_a_rename() {
+        // Same durability guarantee as the hidden flag: keyed on bytes, so the
+        // rename engine cannot lose them.
+        use crate::kind::MediaKind;
+        let mut cat = Catalog::open_in_memory().unwrap();
+        let id = cat.upsert_media(&row("/lib/IMG_1.jpg", 100, 5)).unwrap();
+        cat.set_content_hash(id, "bytes").unwrap();
+        cat.set_rating("bytes", 5).unwrap();
+        cat.set_kind("bytes", Some(MediaKind::Photo)).unwrap();
+
+        cat.apply_moves(&[(
+            PathBuf::from("/lib/IMG_1.jpg"),
+            PathBuf::from("/lib/2019/best.jpg"),
+        )])
+        .unwrap();
+
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.path, PathBuf::from("/lib/2019/best.jpg"));
+        assert_eq!(got.rating, 5);
+        assert_eq!(got.kind_override, Some(MediaKind::Photo));
+    }
+
+    #[test]
+    fn migrating_a_v2_catalog_adds_the_user_meta_columns() {
+        let dir = std::env::temp_dir().join(format!("renamer_migrate_v3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v2.sqlite");
+
+        {
+            // A v2-shaped user_meta: hidden but no rating or kind.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE user_meta (
+                    content_hash TEXT PRIMARY KEY,
+                    hidden INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL);
+                 INSERT INTO user_meta (content_hash, hidden, updated_at)
+                 VALUES ('kept', 1, 0);",
+            )
+            .unwrap();
+        }
+
+        let cat = Catalog::open(&db).unwrap();
+        assert_eq!(cat.schema_version().unwrap(), SCHEMA_VERSION);
+        // The existing hidden flag survives, and the new columns default sanely.
+        assert!(cat.is_hidden("kept").unwrap());
+        let id = cat.upsert_media(&row("/lib/a.jpg", 1, 1)).unwrap();
+        cat.set_content_hash(id, "kept").unwrap();
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert!(got.hidden);
+        assert_eq!(got.rating, 0);
+        assert_eq!(got.kind_override, None);
+
+        cat.set_rating("kept", 3).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].rating, 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn geotag_roundtrips_including_negative_hemispheres() {
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut r = row("/lib/a.jpg", 100, 1);
+        r.lat = Some(-33.8688);
+        r.lon = Some(151.2093);
+        cat.upsert_media(&r).unwrap();
+
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.lat, Some(-33.8688));
+        assert_eq!(got.lon, Some(151.2093));
+        assert_eq!(got.coords(), Some((-33.8688, 151.2093)));
+    }
+
+    #[test]
+    fn a_photo_with_no_geotag_has_no_coords() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        assert_eq!(cat.all_present(Visibility::All).unwrap()[0].coords(), None);
+    }
+
+    #[test]
+    fn half_a_geotag_yields_no_coords() {
+        // One axis alone cannot place a photo.
+        let cat = Catalog::open_in_memory().unwrap();
+        let mut r = row("/lib/a.jpg", 100, 1);
+        r.lat = Some(51.5);
+        cat.upsert_media(&r).unwrap();
+        let got = &cat.all_present(Visibility::All).unwrap()[0];
+        assert_eq!(got.lat, Some(51.5));
+        assert_eq!(got.coords(), None);
+    }
+
+    #[test]
+    fn upsert_stamps_the_current_metadata_version() {
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        let stamps = cat.stamps_under(Path::new("/lib")).unwrap();
+        assert_eq!(
+            stamps.get(Path::new("/lib/a.jpg")).unwrap().meta_version,
+            META_VERSION
+        );
+    }
+
+    #[test]
+    fn rows_from_an_older_catalog_report_an_older_metadata_version() {
+        // This is what makes a newly-extracted field reach files indexed before
+        // it existed: the stamp is behind, so the indexer re-examines them.
+        let cat = Catalog::open_in_memory().unwrap();
+        cat.upsert_media(&row("/lib/a.jpg", 100, 1)).unwrap();
+        cat.mark_meta_stale_for_tests();
+
+        let stamps = cat.stamps_under(Path::new("/lib")).unwrap();
+        let stamp = stamps.get(Path::new("/lib/a.jpg")).unwrap();
+        assert!(
+            stamp.meta_version < META_VERSION,
+            "stale row must be detectable"
+        );
+        // Size and mtime still match, so version is the only thing that would
+        // trigger a re-read.
+        assert_eq!((stamp.size, stamp.mtime), (100, 1));
+    }
+
+    #[test]
+    fn migrating_a_v3_catalog_adds_geotag_columns_and_a_zero_stamp() {
+        let dir = std::env::temp_dir().join(format!("renamer_migrate_v4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("v3.sqlite");
+
+        {
+            // v3 media: everything up to dom_color, no lat/lon/meta_version.
+            let conn = Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE media (
+                    id INTEGER PRIMARY KEY, path TEXT NOT NULL UNIQUE,
+                    file_name TEXT NOT NULL, ext TEXT NOT NULL,
+                    size INTEGER NOT NULL, mtime INTEGER NOT NULL,
+                    date_taken INTEGER, camera_make TEXT, camera_model TEXT,
+                    lens TEXT, iso TEXT, width INTEGER, height INTEGER,
+                    content_hash TEXT, phash INTEGER,
+                    missing INTEGER NOT NULL DEFAULT 0, dom_color INTEGER);
+                 INSERT INTO media (path, file_name, ext, size, mtime, content_hash, dom_color)
+                 VALUES ('/lib/old.jpg', 'old.jpg', 'jpg', 42, 7, 'kept', 255);",
+            )
+            .unwrap();
+        }
+
+        let cat = Catalog::open(&db).unwrap();
+        assert_eq!(cat.schema_version().unwrap(), SCHEMA_VERSION);
+
+        let rows = cat.all_present(Visibility::All).unwrap();
+        assert_eq!(rows.len(), 1, "existing row preserved");
+        assert_eq!(rows[0].content_hash.as_deref(), Some("kept"));
+        assert_eq!(rows[0].dom_color, Some(255), "earlier work kept");
+        assert_eq!(rows[0].coords(), None, "new columns read as NULL");
+
+        // And the stamp defaults to 0, so this row is queued for a re-read
+        // rather than being stuck without coordinates forever.
+        let stamps = cat.stamps_under(Path::new("/lib")).unwrap();
+        assert_eq!(stamps.get(Path::new("/lib/old.jpg")).unwrap().meta_version, 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
