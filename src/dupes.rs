@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use crate::catalog::MediaRow;
 use crate::hashing::{self, BkTree};
+use crate::union_find::UnionFind;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DupKind {
@@ -385,41 +386,6 @@ fn suggest_keeper(members: &[MediaRow]) -> usize {
         }
     }
     best
-}
-
-/// Disjoint-set forest with path halving and union by size.
-struct UnionFind {
-    parent: Vec<usize>,
-    size: Vec<usize>,
-}
-
-impl UnionFind {
-    fn new(n: usize) -> Self {
-        Self {
-            parent: (0..n).collect(),
-            size: vec![1; n],
-        }
-    }
-
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.parent[x] != x {
-            self.parent[x] = self.parent[self.parent[x]];
-            x = self.parent[x];
-        }
-        x
-    }
-
-    fn union(&mut self, a: usize, b: usize) {
-        let (mut ra, mut rb) = (self.find(a), self.find(b));
-        if ra == rb {
-            return;
-        }
-        if self.size[ra] < self.size[rb] {
-            std::mem::swap(&mut ra, &mut rb);
-        }
-        self.parent[rb] = ra;
-        self.size[ra] += self.size[rb];
-    }
 }
 
 #[cfg(test)]
@@ -818,17 +784,6 @@ mod tests {
         assert_eq!(rep.groups[1].reclaimable, 10);
     }
 
-    #[test]
-    fn union_find_unions_and_finds() {
-        let mut uf = UnionFind::new(6);
-        uf.union(0, 1);
-        uf.union(1, 2);
-        uf.union(4, 5);
-        assert_eq!(uf.find(0), uf.find(2));
-        assert_eq!(uf.find(4), uf.find(5));
-        assert_ne!(uf.find(0), uf.find(3));
-        assert_ne!(uf.find(0), uf.find(4));
-        uf.union(0, 2); // idempotent
-        assert_eq!(uf.find(0), uf.find(2));
-    }
+    // UnionFind itself is exercised directly in src/union_find.rs; the near-
+    // duplicate tests above already cover it end-to-end through this module.
 }

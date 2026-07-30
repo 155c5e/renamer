@@ -46,6 +46,36 @@ Indexing is batch work done once per photo and cached, so a pure-Rust runtime
 being a few times slower costs a slower first index and nothing else. That is a
 good trade for keeping the single binary.
 
+## Clustering engine
+
+The part that groups embeddings into people (`src/faces.rs`) is already built
+and fully tested — with synthetic vectors, since it has no dependency on
+`tract-onnx` or on real model output. It does the same job the near-duplicate
+detector does for images: single-linkage clustering via cosine similarity and
+the same `UnionFind` (now shared between the two in `src/union_find.rs`),
+with the same trade-off — a chain of similar-enough faces can join into one
+cluster even if the two ends of the chain do not resemble each other. Treat a
+cluster as a suggestion, same as a near-duplicate group: merge, split and
+rename are mandatory, not optional polish.
+
+One difference from duplicate detection: every face lands in some cluster,
+including a cluster of one. A person seen in a single photo is still worth
+naming, so there is no size-1 filter the way there is for duplicates.
+
+`cluster_faces` is O(n^2) in the number of faces — there is no BK-tree
+equivalent for cosine similarity over a continuous, high-dimensional vector
+the way there is for a 64-bit perceptual hash's Hamming distance. Fine at a
+few thousand faces; would need an approximate nearest-neighbour index at tens
+of thousands. Not worth building before real usage proves it necessary.
+
+What is still missing, in order:
+
+1. **Inference** — decode SCRFD to find face boxes, run the recognizer on each
+   crop, produce a `DetectedFace` per face. Needs the model files above.
+2. **Catalog storage** — `faces` and `people` tables. Not added yet because
+   there is nothing to populate them until step 1 exists.
+3. **UI** — browse people, rename a cluster, merge two, split a bad one out.
+
 ## Expectations
 
 Face recognition on a personal library works well on adults facing the camera,

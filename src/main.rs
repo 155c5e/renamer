@@ -5,6 +5,7 @@ mod catalog;
 mod colour;
 mod dupes;
 mod engine;
+mod faces;
 mod hashing;
 mod indexer;
 mod kind;
@@ -15,6 +16,7 @@ mod quarantine;
 mod slideshow;
 mod template;
 mod thumbs;
+mod union_find;
 
 use app::RenamerApp;
 
